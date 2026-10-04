@@ -16,8 +16,8 @@ from sentinel.risk.sessions import crosses_weekly_close
 __all__ = ["RULES", "currency_exposure"]
 
 
-def currency_exposure(ctx: Context) -> dict[Currency, Decimal]:
-    """Signed risk per currency (% of equity) after adding the candidate.
+def currency_exposure(ctx: Context, *, include_candidate: bool = True) -> dict[Currency, Decimal]:
+    """Signed risk per currency (% of equity), with or without the candidate.
 
     A long EURUSD position puts its stop-risk on EUR (+) and against USD (-). Summing per
     currency exposes concentration that pairwise correlation hides: long EURUSD, GBPUSD
@@ -27,7 +27,8 @@ def currency_exposure(ctx: Context) -> dict[Currency, Decimal]:
     legs: list[tuple[str, Side, Decimal]] = [
         (p.symbol, p.side, p.risk_amount.amount) for p in ctx.positions
     ]
-    legs.append((ctx.candidate.symbol, ctx.candidate.side, ctx.prospective_risk))
+    if include_candidate:
+        legs.append((ctx.candidate.symbol, ctx.candidate.side, ctx.prospective_risk))
     for symbol, side, risk in legs:
         inst = ctx.instrument_for(symbol)
         pct = ctx.pct_of_equity(risk)
@@ -37,15 +38,31 @@ def currency_exposure(ctx: Context) -> dict[Currency, Decimal]:
 
 
 def currency_net_risk(ctx: Context) -> Check:
+    """Each currency the trade touches must end within the limit, or, if the book is
+    already over the limit in that currency, strictly closer to zero than before.
+
+    The second clause keeps risk-reducing trades possible in a breached book (for example
+    after equity fell and existing exposure grew as a share of it). A trade that leaves a
+    breached currency unchanged or worse is still blocked.
+    """
     limit = ctx.policy.max_currency_net_risk.value
-    net = currency_exposure(ctx)
-    touched = {c: net.get(c, Decimal(0)) for c in ctx.instrument.currencies}
-    worst = max(touched.items(), key=lambda kv: abs(kv[1]))
+    before = currency_exposure(ctx, include_candidate=False)
+    after = currency_exposure(ctx)
+    problems = []
+    notes = []
+    for ccy in ctx.instrument.currencies:
+        b, a = before.get(ccy, Decimal(0)), after.get(ccy, Decimal(0))
+        if abs(a) <= limit:
+            notes.append(f"{ccy} {a:+.3f}%")
+        elif abs(a) < abs(b):
+            notes.append(f"{ccy} {b:+.3f}% -> {a:+.3f}% (reduces a breached exposure)")
+        else:
+            problems.append(f"{ccy} {b:+.3f}% -> {a:+.3f}%")
     return Check(
-        all(abs(v) <= limit for v in touched.values()),
-        f"net risk after trade: {', '.join(f'{c} {v:+.3f}%' for c, v in touched.items())}",
-        observed=f"{worst[0]} {worst[1]:+.4f}%",
-        threshold=f"|net| <= {limit}%",
+        not problems,
+        "net risk after trade: " + "; ".join(problems or notes),
+        observed="; ".join(problems or notes),
+        threshold=f"|net| <= {limit}%, or strictly reduced when already above it",
     )
 
 

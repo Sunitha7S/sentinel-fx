@@ -2,135 +2,132 @@
 
 ## 1. Contract
 
+Implemented in `src/sentinel/risk/kernel.py` (M1).
+
 ```python
-def evaluate(
-    candidate: SignalCandidate | None,      # None ⇒ evaluate account/system gates only
-    account: AccountState,                  # equity, balance, peak, period P&L, open positions, state_version
-    market: MarketContext,                  # prices, spreads, ATRs, blackout windows, circuit-breaker flags
-    ruleset: RuleSet,                       # verified against active_ruleset.sha256
-    as_of: datetime,
-) -> RiskDecision:                          # outcome, approved_units, risk_pct, rule_results[], ruleset_sha256
+@dataclass(frozen=True)
+class RiskInputs:                 # everything a rule may look at; nothing else is reachable
+    decision_id: DecisionId
+    as_of: datetime               # injected; the kernel never reads a clock
+    candidate: SignalCandidate | None
+    policy: RiskPolicy | None
+    active_policy_sha256: str | None
+    system: SystemState | None
+    account: AccountSnapshot | None
+    markets: Mapping[str, MarketSnapshot]
+    calendar: CalendarSnapshot | None
+    news: NewsRiskSnapshot | None
+    instruments: Mapping[str, Instrument]
+    holidays: frozenset[date]
+
+def evaluate(inputs: RiskInputs) -> RiskDecision: ...
 ```
 
 **Properties (enforced by tests):**
-- **Pure.** No I/O, no clock, no randomness, no global state. Same inputs give the same output, byte-for-byte.
-- **Total.** It never raises. Malformed or missing input produces `BLOCKED` with `R-SYS-00 invalid_input`.
-- **Exhaustive.** Every rule is evaluated and reported. The outcome is `APPROVED` iff every HARD rule passes.
-- **Monotone in caution.** Making any input "worse" can never flip `BLOCKED` to `APPROVED`. Examples of worse: higher drawdown, higher spread, nearer event, more exposure. This is checked with property tests.
-- **Small and boring.** Target under 800 lines, 100% branch coverage, `mypy --strict`, no dependencies beyond the standard library, `decimal` and pydantic.
+- **Pure.** No I/O, no clock, no randomness, no global state. The same inputs give an equal decision.
+- **Total.** It never raises. Missing inputs fail `R-SYS-00` and every rule that needs them; a
+  rule that raises fails itself; anything else yields a BLOCKED decision with `R-SYS-99`.
+- **Exhaustive.** Every rule is evaluated and reported. The outcome is APPROVED only if every
+  HARD rule passes and a valid size exists. `RiskDecision` refuses to construct anything else.
+- **Monotone in caution.** Making an input worse never flips BLOCKED to APPROVED. Examples:
+  higher loss, drawdown, spread, data age, news score, or trade count. Property-tested.
+- **Standard library only** (plus `sentinel.domain` and `sentinel.fxmath`), `mypy --strict`.
 
-It runs in two places, from the same library:
-1. the decision graph (`risk_kernel` node);
-2. the execution service, inside the lock, against **fresh broker state** (rule stage `EXECUTION_RECHECK`).
+It runs in two places, from the same code:
+1. the decision path (`decision.risk_gate.RiskGate`, later the LangGraph `risk_kernel` node);
+2. `risk.recheck.recheck_before_execution`, on fresh broker state, before any order (M10).
 
-## 2. Ruleset (human-owned YAML → `risk_rule_sets`)
+## 2. Policy (human-owned YAML → protected store)
 
-Default values are deliberately conservative. **The operator sets the final numbers.** They are listed here so the design is concrete.
+The active policy is [`config/rulesets/rs_v1.yaml`](../config/rulesets/rs_v1.yaml), parsed by
+`sentinel.config.policy_loader` into a frozen `RiskPolicy` (`sentinel.risk.policy`). The file
+is not duplicated here, so the two cannot drift apart. Loading rejects:
+- unknown keys and missing keys;
+- floats (numbers are read as exact decimals);
+- inconsistent values (e.g. daily > weekly loss, throttle multipliers > 1 or increasing);
+- any value beyond a **code-level ceiling**. These are `CEILINGS` in `risk/policy.py`. The main ones:
 
-```yaml
-id: rs_v1
-account_currency: USD
-limits:
-  risk_per_trade_pct: 0.50          # hard cap enforced in code at 1.00 regardless of YAML
-  max_open_risk_pct: 1.50           # sum of open stop-risk
-  max_open_positions: 3
-  max_positions_per_pair: 1
-  max_new_trades_per_day: 2
-  max_effective_leverage: 5.0       # notional / equity
-  max_margin_utilisation_pct: 20
-loss_limits:                         # measured on equity (incl. unrealised) vs period-start equity
-  daily_pct: 1.5                     # trading day = 17:00 New York → 17:00 New York
-  weekly_pct: 3.0
-  monthly_pct: 5.0
-  max_drawdown_from_peak_pct: 10.0   # ⇒ HALTED, human reset required
-drawdown_throttle:                   # automatic, tighten-only, pre-approved
-  - {dd_pct: 4.0, risk_multiplier: 0.75}
-  - {dd_pct: 6.0, risk_multiplier: 0.50}
-  - {dd_pct: 8.0, risk_multiplier: 0.25}
-streaks:
-  cooldown_after_consecutive_losses: 3
-  cooldown_hours: 24
-  halt_after_consecutive_losses: 5   # ⇒ HALTED pending review
-exposure:
-  max_currency_net_risk_pct: 1.0     # per currency, signed sum (see §4)
-  max_gap_loss_pct: 2.5              # worst-case gap scenario of whole book
-  max_var99_1d_pct: 2.0
-trade_quality:
-  min_rr_net: 1.8
-  min_stop_atr_h1: 1.0
-  max_stop_atr_h1: 4.0
-  min_stop_spread_multiple: 10
-  max_entry_drift_atr: 0.25          # execution recheck
-  signal_ttl_minutes: 15
-market:
-  max_spread_ratio: 1.5              # vs session median
-  blackout:
-    tier1_before_min: 60
-    tier1_after_min: 60
-    central_bank_before_min: 120
-    central_bank_after_min: 30       # after press conference end
-    tier2_before_min: 30
-    tier2_after_min: 30
-  rollover_no_trade: {start: "16:45", end: "17:30", tz: America/New_York}
-  friday_no_new_entries_after_utc: "18:00"
-  weekend_hold: require_stop_at_breakeven_or_close
-  holiday_thin_liquidity: block_entries
-  event_hold_policy: no_open_risk_in_affected_ccy_through_tier1_unless_stop_at_breakeven
-data:
-  max_price_age_s: 10
-  max_market_report_age_s: 360
-  max_calendar_age_s: 21600
-  max_news_feed_silence_s: 900
-  max_portfolio_snapshot_age_s: 120
-execution:
-  approval_ttl_s: 120
-  require_broker_side_stop: true     # code-enforced; YAML cannot disable
-```
+| Field | Ceiling |
+|---|---|
+| risk per trade | ≤ 1.0 % (also capped again in sizing) |
+| max open risk | ≤ 5 % |
+| positions per pair | ≤ 1 (no pyramiding; revisit after M6–M8) |
+| daily / weekly / monthly loss | ≤ 3 % / 6 % / 10 % |
+| max drawdown | ≤ 20 % |
+| effective leverage | ≤ 10× |
+| min reward/risk net of costs | ≥ 1.0 |
+| price / account / calendar freshness | ≤ 60 s / 300 s / 12 h |
+| approval TTL | ≤ 10 min |
+| broker-side stop | always required |
 
-**Code-level ceilings** cannot be overridden by YAML. A YAML file that exceeds them is rejected when it is loaded:
-- risk per trade ≤ 1.0%
-- daily loss ≤ 3%
-- max drawdown ≤ 20%
-- broker-side stop is always required
-- leverage ≤ 10
+Loss limits are measured on **equity including unrealised P&L**, against **period-start
+equity**, and include the new trade's risk. Example: the day starts at 10,000 with a
+floating loss of 800, so equity is 9,200, an 8 % daily loss; new risk is judged against that.
 
 ## 3. Rule catalogue
 
-Rules are grouped by tier. All are HARD unless marked otherwise.
+All rules are HARD. Every decision reports every rule. This table is checked against the code
+by `tests/unit/risk/test_rule_catalogue.py`: adding, removing or renumbering a rule without
+updating this table fails the build.
 
-| ID | Tier | Rule | Observed vs threshold |
-|---|---|---|---|
-| R-SYS-00 | System | Inputs well-formed and present | — |
-| R-SYS-01 | System | Trading state == ACTIVE | state |
-| R-SYS-02 | System | Mode permits orders (or SHADOW → simulated) | mode |
-| R-SYS-03 | System | Ruleset sha256 == active_ruleset.sha256 | hashes |
-| R-SYS-04 | System | All input snapshots within staleness budgets | ages |
-| R-SYS-05 | System | Last reconciliation matched and is < 120s old | age, matched |
-| R-SYS-06 | System | No active circuit breaker on pair or its currencies | flags |
-| R-ACC-01 | Account | Daily loss < limit | −1.2% vs 1.5% |
-| R-ACC-02 | Account | Weekly loss < limit | |
-| R-ACC-03 | Account | Monthly loss < limit | |
-| R-ACC-04 | Account | Not in consecutive-loss cooldown | |
-| R-ACC-05 | Account | Drawdown from peak < halt level (breach ⇒ HALTED) | |
-| R-ACC-06 | Account | New trades today < max | |
-| R-MKT-01 | Market | Not within blackout for base or quote currency over [entry, entry + expected hold ∧ 4h] | |
-| R-MKT-02 | Market | spread ≤ max_spread_ratio × session median and ≤ instrument absolute cap | |
-| R-MKT-03 | Market | Not in rollover window | |
-| R-MKT-04 | Market | Not after Friday cutoff; not a thin-liquidity holiday | |
-| R-MKT-05 | Market | Volatility regime ≠ extreme | |
-| R-MKT-06 | Market | No news tripwire active for either currency | |
-| R-TRD-01 | Trade | Stop exists, on the correct side, distance in [min, max]×ATR(H1), ≥ 10× spread | |
-| R-TRD-02 | Trade | rr_net ≥ min | |
-| R-TRD-03 | Trade | Signal not expired | |
-| R-TRD-04 | Trade | Computed units ≥ broker min after round-down | |
-| R-TRD-05 | Trade | Margin after trade ≤ limit; effective leverage ≤ limit | |
-| R-PTF-01 | Portfolio | Per-currency net risk after trade ≤ limit | |
-| R-PTF-02 | Portfolio | Total open risk after trade ≤ limit | |
-| R-PTF-03 | Portfolio | Open positions after trade ≤ max; ≤ 1 per pair | |
-| R-PTF-04 | Portfolio | Gap-scenario loss after trade ≤ limit | |
-| R-PTF-05 | Portfolio | 1-day VaR99 after trade ≤ limit | |
-| R-EXE-01 | Exec recheck | Price drift ≤ max_entry_drift × ATR | |
-| R-EXE-02 | Exec recheck | 3 approvals present, same state_version, unexpired, payload hash matches | |
+| ID | Stage | Rule |
+|---|---|---|
+| R-SYS-00 | System | All required inputs present: candidate, policy, active policy hash, system state, account, calendar, news, and a market and instrument for every symbol in use |
+| R-SYS-01 | System | Trading state is ACTIVE |
+| R-SYS-02 | System | Policy hash equals the approved active policy hash |
+| R-SYS-03 | System | Account snapshot fresh (age within [−clock skew, max]) |
+| R-SYS-04 | System | Market data fresh for every symbol in use (snapshot age and last tick) |
+| R-SYS-05 | System | Calendar fresh |
+| R-SYS-06 | System | Calendar sources agree, and at least `min_calendar_sources` |
+| R-SYS-07 | System | News risk fresh |
+| R-SYS-08 | System | Broker reconciliation matched and recent |
+| R-SYS-09 | System | No circuit breaker on any market sharing a currency with the trade |
+| R-SYS-10 | System | Every open position has a broker-side stop |
+| R-ACC-01 | Account | Daily loss including this trade's risk ≤ limit |
+| R-ACC-02 | Account | Weekly loss including this trade's risk ≤ limit |
+| R-ACC-03 | Account | Monthly loss including this trade's risk ≤ limit |
+| R-ACC-04 | Account | Drawdown from peak < halt level |
+| R-ACC-05 | Account | Not in the consecutive-loss cooldown |
+| R-ACC-06 | Account | Consecutive losses below the halt count |
+| R-ACC-07 | Account | Trades today below the daily maximum |
+| R-MKT-01 | Market | No tier-1, tier-2 or central-bank blackout for either currency over [now, now + min(expected hold, max hold horizon)] |
+| R-MKT-02 | Market | Spread ≤ ratio × session median and ≤ the instrument's absolute cap |
+| R-MKT-03 | Market | Outside the rollover window (New York time, DST-aware) |
+| R-MKT-04 | Market | Market open; before the Friday cutoff; not a holiday |
+| R-MKT-05 | Market | Volatility regime is not EXTREME |
+| R-MKT-06 | Market | Both currencies have a news assessment, no tripwire, score below limit |
+| R-TRD-01 | Trade | Stop on the loss side; distance within [min, max] × ATR(H1) and ≥ k × spread |
+| R-TRD-02 | Trade | Reward/risk net of spread and expected slippage ≥ minimum |
+| R-TRD-03 | Trade | Signal not future-dated, not expired, TTL within policy |
+| R-TRD-04 | Trade | A valid broker-precision size exists (rounded down; below minimum blocks) |
+| R-TRD-05 | Trade | Gross effective leverage and margin after the trade within limits |
+| R-PTF-01 | Portfolio | Each currency the trade touches ends within the net-risk limit, **or**, if already above it, strictly closer to zero (risk-reducing trades stay possible in a breached book) |
+| R-PTF-02 | Portfolio | Total open stop-risk (gross) after the trade ≤ limit |
+| R-PTF-03 | Portfolio | Open positions after the trade ≤ max; ≤ 1 per pair |
+| R-PTF-04 | Portfolio | Gap-scenario loss (stops fill k × ATR(D1) beyond the level) ≤ limit |
+
+Outside the kernel's per-decision rules:
+
+| ID | Where | Rule |
+|---|---|---|
+| R-SYS-99 | kernel / fail-closed wrapper | Kernel or service failure, timeout, wrong result type, or audit/shadow write failure |
+| R-APR-01 | `risk.approvals` | All required approvals present exactly once |
+| R-APR-02 | `risk.approvals` | Approvals belong to this decision |
+| R-APR-03 | `risk.approvals` | Bound to the current account state version and the decision's snapshot digest |
+| R-APR-04 | `risk.approvals` | Payload (candidate, size, policy hash) unchanged |
+| R-APR-05 | `risk.approvals` | Within the validity window [issued, expires) |
+| R-EXE-01 | `risk.recheck` | Price drift from the signal entry ≤ k × ATR(H1) |
+| R-EXE-02 | `risk.recheck` | The original decision approved this candidate |
+| R-EXE-03 | `risk.recheck` | Policy unchanged since approval |
+
+**Deferred:** a 1-day VaR99 limit (formerly R-PTF-05) needs the covariance model from M11.
+
+**Gross versus net.** R-PTF-01 measures *net* exposure per currency. R-PTF-02 (total stop-risk),
+R-PTF-04 (gap loss) and R-TRD-05 (leverage and margin) are *gross* measures, and a hedge adds
+to all of them. Under rs_v1 (1.0 % net per currency, 1.5 % total, 0.5 % per trade), a book
+that is over a currency limit is necessarily over 1.0 % total open risk, so a new hedge also
+fails R-PTF-02. Whether a hedge in a breached book may pass the gross limits is an open
+policy decision.
 
 ## 4. Position sizing
 
@@ -173,18 +170,26 @@ The sum must stay ≤ `max_gap_loss_pct`. This is the explicit answer to "stops 
 
 ```mermaid
 stateDiagram-v2
-  [*] --> ACTIVE
-  ACTIVE --> NO_NEW_TRADES: daily/weekly/monthly limit · cooldown · circuit breaker · stale data · recon mismatch · tripwire
-  NO_NEW_TRADES --> ACTIVE: auto (period rollover, cooldown expiry, CB clear 30min) — only for auto-clearable causes
-  ACTIVE --> HALTED: max DD breach · 5 consecutive losses · multi-pair jump · unknown position at broker
-  NO_NEW_TRADES --> HALTED: same
-  ACTIVE --> FLATTEN: human kill switch (flatten)
-  FLATTEN --> HALTED: all positions closed
-  HALTED --> NO_NEW_TRADES: human reset (re-auth + written reason)
+  [*] --> HALTED: system start (no trading until a human activates)
+  HALTED --> NO_NEW_TRADES: human (step-up auth + written reason)
   NO_NEW_TRADES --> ACTIVE: human
+  ACTIVE --> NO_NEW_TRADES: human, or automatic precaution
+  ACTIVE --> HALTED: volatility shock · feed failure · broker or reconciliation issue · calendar disagreement · max DD · loss-streak halt
+  NO_NEW_TRADES --> HALTED: same
+  ACTIVE --> FLATTEN: human kill switch
+  FLATTEN --> HALTED: all positions closed
 ```
 
-Every transition writes `system_state_log` with an actor and a reason, and raises an alert.
+Rules (implemented in `risk/state_machine.py`, tested in `tests/safety`):
+- **Automatic actors only tighten.** No automatic transition ever moves towards ACTIVE.
+  There is **no auto-clear**: after a volatility shock, feed failure, broker issue or calendar
+  disagreement the system stays HALTED until a human has reviewed it.
+- **Humans loosen one step at a time:** HALTED → NO_NEW_TRADES → ACTIVE. FLATTEN can only
+  end in HALTED.
+- Period loss limits, cooldowns and streak limits are **not** sticky states. The kernel
+  evaluates them on every decision (R-ACC-*), so they block for exactly as long as they apply.
+- Every transition, and every refused transition, is written to the audit chain *before*
+  the state changes. If the audit write fails, the state does not change.
 
 ## 6. Risk of ruin (Agent 9 feeds it; the risk kernel consumes the result)
 

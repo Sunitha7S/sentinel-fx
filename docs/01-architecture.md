@@ -86,7 +86,7 @@ One code path runs in five modes. The mode is a value in the `system_state` row.
 | `LIVE_MICRO` | live | yes | live, risk capped at 0.1%/trade | validate real fills and slippage |
 | `LIVE` | live | yes | live, ruleset risk | production |
 
-Orthogonal **trading states**: `ACTIVE`, `NO_NEW_TRADES` (manage existing positions only), `FLATTEN` (close everything, then `NO_NEW_TRADES`), `HALTED` (needs a human to reset).
+Orthogonal **trading states**: `ACTIVE`, `NO_NEW_TRADES` (manage existing positions only), `FLATTEN` (close everything, then `HALTED`), `HALTED` (needs a human to reset; the state a fresh system starts in).
 
 ## 3. Agent specifications
 
@@ -114,11 +114,11 @@ Every agent has: **inputs**, **output contract** (a Pydantic model persisted to 
   - **Tier 3:** logged only.
 - **Maps** each event to affected **currencies**, then to pairs (USD events affect all 5 pairs).
 - **Output:** `RiskCalendar{as_of, events[], blackout_windows[{currency, start, end, tier, reason}], source_agreement: bool, feed_fresh: bool}`
-- **Failure:** feed stale > 6h, or the two sources disagree on a tier-1 time by > 5 min → `NO_NEW_TRADES` until resolved. *This is deliberately conservative: a missing calendar means flying blind.*
+- **Failure:** feed stale > 6h, or the two sources disagree on a tier-1 time by > 5 min → `HALTED` until a human has reviewed it. *This is deliberately conservative: a missing calendar means flying blind.*
 
 ### Agent 3 — News Intelligence → `NewsRiskAssessment`
 Two layers. The **deterministic layer always runs first and alone can block.**
-1. **Tripwires** (regex/keyword, per currency): `intervention`, `emergency (meeting|cut|hike)`, `unscheduled`, `peg`, `capital controls`, `default`, `sanctions`, `invasion`, `bank (run|failure)`, `circuit breaker`, `flash crash`, plus central-bank names combined with surprise verbs. A hit on a credible source sets `NO_NEW_TRADES` on the affected currency for 4h, pending human review.
+1. **Tripwires** (regex/keyword, per currency): `intervention`, `emergency (meeting|cut|hike)`, `unscheduled`, `peg`, `capital controls`, `default`, `sanctions`, `invasion`, `bank (run|failure)`, `circuit breaker`, `flash crash`, plus central-bank names combined with surprise verbs. A hit on a credible source blocks new risk in the affected currency until a human clears it (no automatic expiry).
 2. **LLM classifier** (PydanticAI, primary provider). The headline/body is wrapped as **untrusted data** and the output is forced into this schema:
    ```python
    class NewsClassification(BaseModel):

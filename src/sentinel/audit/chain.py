@@ -3,6 +3,11 @@
 Each record's hash covers its sequence number, timestamp, kind, subject, canonical payload
 and the previous record's hash. Editing, inserting, reordering or deleting any record
 breaks verification from that point on.
+
+Two attacks an unkeyed chain cannot detect on its own: truncating the newest records, and
+recomputing every hash after an edit. Both are caught by verifying against an
+``AuditHead`` (sequence number and hash of the last record) stored somewhere the log's
+writer cannot rewrite. M1 provides the check; M2 persists the head separately (ADR 0008).
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from sentinel.domain.types import require_utc
 __all__ = [
     "GENESIS_HASH",
     "AuditChainError",
+    "AuditHead",
     "AuditKind",
     "AuditLog",
     "AuditRecord",
@@ -92,10 +98,27 @@ def seal(
     return dataclasses.replace(unsealed, hash=_digest(unsealed.body()))
 
 
-def verify_chain(records: Iterable[AuditRecord]) -> int:
-    """Verify an entire chain from genesis. Returns the number of records."""
+@dataclass(frozen=True, slots=True)
+class AuditHead:
+    """The last record's sequence number and hash: the anchor for a verified chain."""
+
+    seq: int
+    hash: str
+
+    @classmethod
+    def of(cls, record: AuditRecord) -> AuditHead:
+        return cls(record.seq, record.hash)
+
+
+def verify_chain(records: Iterable[AuditRecord], *, expected_head: AuditHead | None = None) -> int:
+    """Verify an entire chain from genesis. Returns the number of records.
+
+    With ``expected_head``, the chain must also end exactly at that record, which detects
+    truncation of the newest records and wholesale re-hashing after an edit.
+    """
     prev = GENESIS_HASH
     count = 0
+    last: AuditRecord | None = None
     for expected_seq, record in enumerate(records, start=1):
         if record.seq != expected_seq:
             raise AuditChainError(f"sequence gap: expected {expected_seq}, found {record.seq}")
@@ -105,6 +128,10 @@ def verify_chain(records: Iterable[AuditRecord]) -> int:
             raise AuditChainError(f"record {record.seq}: content does not match its hash")
         prev = record.hash
         count += 1
+        last = record
+    if expected_head is not None and (last is None or AuditHead.of(last) != expected_head):
+        found = AuditHead.of(last) if last else None
+        raise AuditChainError(f"chain head {found} does not match anchor {expected_head}")
     return count
 
 

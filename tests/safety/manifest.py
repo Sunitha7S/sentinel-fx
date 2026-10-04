@@ -29,6 +29,10 @@ REQUIRED_INVARIANTS: dict[str, str] = {
     "INV-RECHECK-01": "Execution re-evaluates risk from fresh account and market state.",
     "INV-FAILCLOSED-01": "Any service failure produces BLOCKED.",
     "INV-AUDIT-01": "Every risk decision is in a tamper-evident audit chain.",
+    "INV-AUDIT-IMMUTABLE": (
+        "No historical decision can be modified without breaking verification "
+        "(internal edits: chain alone; truncation and full re-hash: against the anchored head)."
+    ),
     "INV-SHADOW-01": "Every candidate is persisted as a shadow trade.",
     "INV-LLM-01": "LLM output can only add caution; it cannot loosen any decision.",
     "INV-LLM-02": "LLM-facing code cannot reach trading state, policy or execution.",
