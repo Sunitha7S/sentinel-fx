@@ -224,8 +224,8 @@ flowchart LR
   F --> E
 ```
 
-- The learning service's DB role cannot insert into `risk_rule_sets` or update `active_ruleset` (docs/02 §9).
-- The risk kernel refuses to run if the in-memory ruleset hash ≠ `active_ruleset.sha256` (R-SYS-03).
+- The learning role (`svc_learning`) has no write privilege of any kind on `policy_versions` or `policy_activations`, and owns nothing (ADR 0011); tests try 13 ways to modify them.
+- The risk kernel blocks if the policy it was given is not the active policy (R-SYS-02), and the database refuses an APPROVED decision that references any other policy.
 - **No loosening while HALTED or in drawdown > 5%.** This is code-enforced. It stops anyone "fixing" a drawdown by raising limits, a classic failure of discretionary traders.
 
 ## 8. Testing requirements (gate for merging anything under `risk/`)

@@ -64,4 +64,17 @@ uv run sentinel audit-verify var/shadow/audit.jsonl      # verify an audit hash 
 
 Order execution is hard-disabled in code until M10 (ADR 0007).
 
+Database and market data (M2):
+
+```bash
+docker compose -f docker/compose.yaml up -d postgres                 # PostgreSQL 16
+uv run alembic upgrade head                                          # needs SENTINEL_DATABASE_URL
+uv run sentinel ingest --symbols EUR_USD,USD_JPY --from 2015-01-01   # needs SENTINEL_OANDA_TOKEN
+uv run sentinel data-report --output data-quality.md
+uv run sentinel db-security-report --output db-security.md
+```
+
+Database tests need `SENTINEL_TEST_DATABASE_URL` (a disposable server). In CI they fail rather
+than skip when the database is missing.
+
 Architecture decisions that refine or deviate from the design are recorded in [docs/adr](docs/adr).

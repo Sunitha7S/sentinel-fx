@@ -103,7 +103,7 @@ For each rule `r` and each blocked candidate whose **only** blocking rule was `r
 | Proposal kind | Who can apply | Path |
 |---|---|---|
 | `STRATEGY_PARAM`, `FILTER`, `DETECTOR_DISABLE` | Human, in console | New detector version (`semver` bump) → backtest OOS → shadow ≥ 2 weeks → enable |
-| `RISK_RULE` | Human with `human_risk_admin` re-auth | Change request → replay → approval → cooling-off if loosening (docs/04 §7) |
+| `RISK_RULE` | Human with step-up re-auth (`human_admin` DB role) | Change request → replay → approval → cooling-off if loosening (docs/04 §7) |
 
 Proposals expire after 30 days if not reviewed. Rejected proposals are kept, with the reason, and the same proposal is not raised again for 90 days unless the evidence gets ≥ 2× stronger.
 
