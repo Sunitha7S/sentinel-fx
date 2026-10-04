@@ -18,7 +18,6 @@ from psycopg import errors as pg
 from sqlalchemy import Engine, text
 from sqlalchemy.exc import DBAPIError
 
-from db.conftest import Db
 from sentinel.domain.system import TradingState
 from sentinel.domain.types import DecisionId, Percent
 from sentinel.risk.governance import (
@@ -34,6 +33,7 @@ from sentinel.store.postgres.decision_store import PostgresDecisionStore
 from sentinel.store.postgres.engine import OWNER_ROLE, SERVICE_ROLES
 from sentinel.store.postgres.policy_store import PolicyIntegrityError, PostgresPolicyStore
 
+from db.conftest import Db
 from support.builders import inputs, policy
 
 ADMIN = issue_human_risk_admin("operator", step_up_verified=True)

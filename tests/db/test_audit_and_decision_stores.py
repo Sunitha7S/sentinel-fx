@@ -13,8 +13,6 @@ from hypothesis import strategies as st
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
-from db.conftest import Db
-from db.test_policy_immutability import ADMIN, T0
 from sentinel.audit.chain import AuditChainError, AuditKind, AuditLog, seal
 from sentinel.decision.risk_gate import RiskGate
 from sentinel.domain.decision import Outcome, shadow_record_from
@@ -26,6 +24,8 @@ from sentinel.store.postgres.audit_sink import PostgresAuditSink
 from sentinel.store.postgres.decision_store import PostgresDecisionStore, PostgresShadowStore
 from sentinel.store.postgres.policy_store import PostgresPolicyStore
 
+from db.conftest import Db
+from db.test_policy_immutability import ADMIN, T0
 from support.builders import NOW, inputs, policy
 from support.fakes import FixedClock, StaticProvider
 

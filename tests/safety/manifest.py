@@ -52,5 +52,9 @@ REQUIRED_INVARIANTS: dict[str, str] = {
     "INV-DB-APPEND-ONLY": (
         "UPDATE, DELETE and TRUNCATE are refused on append-only tables even for the owner."
     ),
+    "INV-MD-READONLY": (
+        "Market-data providers can only issue GET requests for historical candles on the "
+        "practice host; order, account and streaming endpoints are unreachable."
+    ),
     "INV-EXEC-01": "Execution is disabled; live trading needs explicit, consistent enabling.",
 }

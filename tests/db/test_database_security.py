@@ -10,9 +10,10 @@ from psycopg import errors as pg
 from sqlalchemy import Engine, text
 from sqlalchemy.exc import DBAPIError
 
-from db.conftest import Db
 from sentinel.store.postgres.engine import OWNER_ROLE, SERVICE_ROLES
 from sentinel.store.postgres.permissions import POLICY_TABLES, PRIVILEGES, TABLES, expected
+
+from db.conftest import Db
 
 DENIED = (pg.InsufficientPrivilege,)
 
