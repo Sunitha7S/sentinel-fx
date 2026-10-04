@@ -54,4 +54,14 @@ uv run poe safety    # only the safety-invariant tests
 uv run pytest --cov  # full suite with coverage gate
 ```
 
+Read-only inspection commands (M1):
+
+```bash
+uv run sentinel policy-hash config/rulesets/rs_v1.yaml   # validate a policy, print its hash
+uv run sentinel settings --env live                      # effective settings; execution status
+uv run sentinel audit-verify var/shadow/audit.jsonl      # verify an audit hash chain
+```
+
+Order execution is hard-disabled in code until M10 (ADR 0007).
+
 Architecture decisions that refine or deviate from the design are recorded in [docs/adr](docs/adr).

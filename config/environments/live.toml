@@ -1,0 +1,12 @@
+# LIVE account. Disabled by default and must stay disabled in the repository.
+# Enabling requires: the evaluation promotion gates (docs/06 section 2.5), the code-level
+# execution guard lifted in a reviewed release, and SENTINEL_EXECUTION_ENABLED=true plus
+# SENTINEL_LIVE_TRADING_ENABLED=true set on the server itself.
+environment = "live"
+mode = "LIVE_MICRO"
+broker_environment = "LIVE"
+execution_enabled = false
+live_trading_enabled = false
+ruleset_path = "config/rulesets/rs_v1.yaml"
+audit_log_path = "var/live/audit.jsonl"
+shadow_log_path = "var/live/shadow_trades.jsonl"

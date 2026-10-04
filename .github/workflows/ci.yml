@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "17 3 * * *" # nightly deep property run
 
 permissions:
   contents: read
@@ -60,3 +62,18 @@ jobs:
       # if any invariant listed in tests/safety/manifest.py has no marked test, so an
       # invariant cannot be dropped silently by deleting its tests.
       - run: uv run pytest -m invariant -q
+
+  deep-properties:
+    name: deep property run (nightly, 5000 examples)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      HYPOTHESIS_PROFILE: deep
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync
+      - run: uv run pytest tests/property tests/safety -q

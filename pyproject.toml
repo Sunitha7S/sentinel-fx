@@ -6,7 +6,11 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Proprietary" }
 authors = [{ name = "Sunitha" }]
-dependencies = []
+dependencies = [
+    "pydantic>=2.9",
+    "pyyaml>=6.0",
+    "tzdata>=2024.1",
+]
 
 [project.scripts]
 sentinel = "sentinel.cli:main"
@@ -21,6 +25,7 @@ dev = [
     "import-linter>=2.1",
     "pre-commit>=4.0",
     "poethepoet>=0.29",
+    "types-pyyaml>=6.0",
 ]
 
 [build-system]
@@ -53,6 +58,7 @@ select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF", "N", "S", "DTZ", "PT", "P
 ignore = [
     "PLR0913", # explicit keyword-only arguments are preferred over parameter objects in pure functions
     "PLR2004", # thresholds are named in the policy; literals in tests are intentional
+    "N818",    # domain exceptions are named for what they mean (PolicyViolation, ExecutionRefused)
 ]
 
 [tool.ruff.lint.isort]
@@ -61,6 +67,7 @@ known-local-folder = ["safety", "support"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "PLR0915", "PLC0415"]
+"src/sentinel/cli.py" = ["T201"]
 
 # ---------------------------------------------------------------- mypy
 [tool.mypy]
@@ -69,6 +76,7 @@ files = ["src", "tests"]
 mypy_path = ["src", "tests"]
 explicit_package_bases = true
 strict = true
+plugins = ["pydantic.mypy"]
 warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 
@@ -112,6 +120,7 @@ forbidden_modules = [
     "sentinel.audit", "sentinel.store", "sentinel.learning", "sentinel.perception",
     "sentinel.strategy", "sentinel.llm", "sentinel.api", "sentinel.bus", "sentinel.cli",
     "sentinel.indicators", "sentinel.backtest", "sentinel.explain", "sentinel.observability",
+    "sentinel.config", "sentinel.schemas",
 ]
 
 [[tool.importlinter.contracts]]
@@ -122,7 +131,8 @@ forbidden_modules = [
     "sentinel.risk", "sentinel.decision", "sentinel.execution", "sentinel.audit",
     "sentinel.store", "sentinel.learning", "sentinel.perception", "sentinel.strategy",
     "sentinel.llm", "sentinel.api", "sentinel.bus", "sentinel.cli", "sentinel.indicators",
-    "sentinel.backtest", "sentinel.explain", "sentinel.observability",
+    "sentinel.backtest", "sentinel.explain", "sentinel.observability", "sentinel.config",
+    "sentinel.schemas",
 ]
 
 [[tool.importlinter.contracts]]
@@ -133,7 +143,28 @@ forbidden_modules = [
     "sentinel.decision", "sentinel.execution", "sentinel.audit", "sentinel.store",
     "sentinel.learning", "sentinel.perception", "sentinel.strategy", "sentinel.llm",
     "sentinel.api", "sentinel.bus", "sentinel.cli", "sentinel.indicators",
-    "sentinel.backtest", "sentinel.explain", "sentinel.observability",
+    "sentinel.backtest", "sentinel.explain", "sentinel.observability", "sentinel.config",
+    "sentinel.schemas",
+]
+
+[[tool.importlinter.contracts]]
+name = "audit chain depends only on domain"
+type = "forbidden"
+source_modules = ["sentinel.audit"]
+forbidden_modules = [
+    "sentinel.fxmath", "sentinel.risk", "sentinel.decision", "sentinel.execution",
+    "sentinel.store", "sentinel.learning", "sentinel.perception", "sentinel.strategy",
+    "sentinel.llm", "sentinel.api", "sentinel.bus", "sentinel.cli", "sentinel.config",
+    "sentinel.schemas",
+]
+
+[[tool.importlinter.contracts]]
+name = "boundary schemas cannot reach trading state, policy writers or execution"
+type = "forbidden"
+source_modules = ["sentinel.schemas"]
+forbidden_modules = [
+    "sentinel.risk", "sentinel.decision", "sentinel.execution", "sentinel.store",
+    "sentinel.learning", "sentinel.config",
 ]
 
 [[tool.importlinter.contracts]]
@@ -141,13 +172,14 @@ name = "learning cannot reach policy governance, persistence or execution"
 type = "forbidden"
 source_modules = ["sentinel.learning"]
 forbidden_modules = [
-    "sentinel.risk.governance", "sentinel.store", "sentinel.execution", "sentinel.decision",
+    "sentinel.risk.governance", "sentinel.risk.state_machine", "sentinel.store",
+    "sentinel.execution", "sentinel.decision", "sentinel.config",
 ]
 
 [[tool.importlinter.contracts]]
 name = "LLM layer cannot reach trading state, policy or execution"
 type = "forbidden"
-source_modules = ["sentinel.llm"]
+source_modules = ["sentinel.llm", "sentinel.perception.news"]
 forbidden_modules = [
     "sentinel.risk", "sentinel.decision", "sentinel.execution", "sentinel.store",
 ]

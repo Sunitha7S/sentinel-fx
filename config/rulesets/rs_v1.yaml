@@ -1,0 +1,77 @@
+# Risk policy rs_v1. Human-owned. Values here are conservative placeholders for review.
+#
+# This file is not "live" because it exists: a policy becomes active only through the
+# governance flow (sentinel.risk.governance), which records who approved it and when,
+# and applies a 24h cooling-off period to any change that loosens a limit.
+# Code-level ceilings in sentinel.risk.policy reject values beyond hard limits at load time.
+id: rs_v1
+account_currency: USD
+
+limits:
+  risk_per_trade_pct: 0.50
+  max_open_risk_pct: 1.50
+  max_open_positions: 3
+  max_positions_per_pair: 1
+  max_new_trades_per_day: 2
+  max_effective_leverage: 5.0
+  max_margin_utilisation_pct: 20
+
+loss_limits:                    # equity (incl. unrealised) vs period-start equity
+  daily_pct: 1.5                # trading day rolls at 17:00 New York
+  weekly_pct: 3.0
+  monthly_pct: 5.0
+  max_drawdown_pct: 10.0        # from peak equity; breach requires human reset
+
+drawdown_throttle:              # tighten-only: multipliers <= 1, non-increasing
+  - {drawdown_pct: 4.0, risk_multiplier: 0.75}
+  - {drawdown_pct: 6.0, risk_multiplier: 0.50}
+  - {drawdown_pct: 8.0, risk_multiplier: 0.25}
+
+streaks:
+  cooldown_after_consecutive_losses: 3
+  cooldown_hours: 24
+  halt_after_consecutive_losses: 5
+
+exposure:
+  max_currency_net_risk_pct: 1.0
+  max_gap_loss_pct: 2.5
+  gap_atr_multiple_normal: 0.5
+  gap_atr_multiple_event: 1.5   # holding through a weekend close or a tier-1 event
+
+trade_quality:
+  min_rr_net: 1.8
+  min_stop_atr_h1: 1.0
+  max_stop_atr_h1: 4.0
+  min_stop_spread_multiple: 10
+  expected_slippage_pips: 0.2
+  max_entry_drift_atr: 0.25
+  signal_ttl_minutes: 15
+  max_hold_horizon_hours: 4
+
+market:
+  max_spread_ratio: 1.5
+  max_news_risk_score: 40
+  min_calendar_sources: 2
+  blackout_minutes:
+    tier1_before: 60
+    tier1_after: 60
+    central_bank_before: 120
+    central_bank_after: 30
+    tier2_before: 30
+    tier2_after: 30
+  rollover: {start: "16:45", end: "17:30", tz: America/New_York}
+  friday_no_new_entries_after_utc: "18:00"
+
+data_freshness_seconds:
+  price: 10
+  market_snapshot: 360
+  account: 120
+  calendar: 21600
+  news: 900
+  reconciliation: 120
+  max_clock_skew: 2
+
+execution:
+  approval_ttl_seconds: 120
+  require_broker_side_stop: true
+  live_micro_risk_multiplier: 0.2

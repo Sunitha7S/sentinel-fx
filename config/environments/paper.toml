@@ -1,0 +1,10 @@
+# Broker PRACTICE account ("paper trading"). Execution stays off until M10 and an
+# explicit override; even then the code-level guard refuses until it is lifted in review.
+environment = "paper"
+mode = "PAPER"
+broker_environment = "PRACTICE"
+execution_enabled = false
+live_trading_enabled = false
+ruleset_path = "config/rulesets/rs_v1.yaml"
+audit_log_path = "var/paper/audit.jsonl"
+shadow_log_path = "var/paper/shadow_trades.jsonl"

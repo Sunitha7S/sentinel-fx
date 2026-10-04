@@ -1,0 +1,9 @@
+# Live data, decisions recorded, no broker orders. The default environment.
+environment = "shadow"
+mode = "SHADOW"
+broker_environment = "NONE"
+execution_enabled = false
+live_trading_enabled = false
+ruleset_path = "config/rulesets/rs_v1.yaml"
+audit_log_path = "var/shadow/audit.jsonl"
+shadow_log_path = "var/shadow/shadow_trades.jsonl"
