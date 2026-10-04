@@ -71,7 +71,7 @@ def security_report(engine: Engine) -> str:
                     drift.append(
                         f"{role} on {table}: has {held}, expected {sorted(expected(role, table))}"
                     )
-                cells.append("".join(_ABBR[p] for p in held) or "—")
+                cells.append("".join(_ABBR[p] for p in held) or "-")
             lines.append(f"| `{table}` | " + " | ".join(cells) + " |")
         owners = (
             conn.execute(
@@ -83,11 +83,15 @@ def security_report(engine: Engine) -> str:
             .scalars()
             .all()
         )
+        # pg_trigger, not information_schema.triggers: the latter hides triggers on tables
+        # the current role cannot modify, and this report runs as a read-only role.
         triggers = conn.execute(
             text(
-                "SELECT event_object_table AS t, string_agg(DISTINCT trigger_name, ', ') AS names "
-                "FROM information_schema.triggers WHERE trigger_schema = 'sentinel' "
-                "GROUP BY event_object_table ORDER BY 1"
+                "SELECT c.relname AS tbl, string_agg(tg.tgname, ', ' ORDER BY tg.tgname) AS names "
+                "FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = 'sentinel' AND NOT tg.tgisinternal "
+                "GROUP BY c.relname ORDER BY 1"
             )
         ).all()
         truncate_guards = (
@@ -112,7 +116,7 @@ def security_report(engine: Engine) -> str:
         "| Table | Triggers |",
         "|---|---|",
     ]
-    lines += [f"| `{r.t}` | {r.names} |" for r in triggers]
+    lines += [f"| `{r.tbl}` | {r.names} |" for r in triggers]
     lines += [
         "",
         f"TRUNCATE guarded on: {', '.join(truncate_guards)}",
@@ -125,7 +129,7 @@ def security_report(engine: Engine) -> str:
 
 
 def _fmt(ts: datetime | None) -> str:
-    return ts.strftime("%Y-%m-%d %H:%M") if ts else "—"
+    return ts.strftime("%Y-%m-%d %H:%M") if ts else "-"
 
 
 def data_quality_report(
@@ -176,7 +180,7 @@ def data_quality_report(
             lines.append(
                 f"| {s.symbol} | {s.timeframe} | {s.count:,} | {_fmt(s.first)} | {_fmt(s.last)} | "
                 f"{w.weeks * w.expected_per_week:,} | {w.completeness_pct}% | weekly: "
-                f"{len(w.short_weeks)} short weeks | — | — |"
+                f"{len(w.short_weeks)} short weeks | - | - |"
             )
         stats = store.spread_stats(s.symbol, s.timeframe)
         details_spread = (

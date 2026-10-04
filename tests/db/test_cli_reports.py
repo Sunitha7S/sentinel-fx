@@ -68,6 +68,9 @@ def test_ingest_then_reports(
     security = capsys.readouterr().out
     assert "Matrix drift: **none**" in security
     assert "Object owners in schema `sentinel`: sentinel_owner" in security
+    assert "| `decisions` | decisions_no_truncate, decisions_no_update_delete, " in security
+    assert "audit_records_extend_head" in security
+    assert "—" not in security
 
 
 def test_ingest_without_configuration_fails_cleanly(
