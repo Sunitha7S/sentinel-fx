@@ -238,6 +238,109 @@ class RiskPolicy:
 
     # ------------------------------------------------------------------ construction
 
+    def to_mapping(self) -> dict[str, Any]:
+        """The exact inverse of ``from_mapping``: ``from_mapping(p.to_mapping()) == p``.
+
+        Decimals are written as strings, so the mapping is JSON-safe without floats. Used to
+        persist a policy version so it can be re-parsed and its hash re-verified on load.
+        """
+
+        def d(value: Decimal | Percent) -> str:
+            return str(value.value if isinstance(value, Percent) else value)
+
+        def whole(delta: timedelta, unit: timedelta, name: str) -> int:
+            if delta % unit:
+                raise PolicyViolation(f"{name} must be a whole number of {unit}")
+            return delta // unit
+
+        def hhmm(value: time, name: str) -> str:
+            if value.second or value.microsecond:
+                raise PolicyViolation(f"{name} must be a whole minute")
+            return value.strftime("%H:%M")
+
+        minute, hour, second = timedelta(minutes=1), timedelta(hours=1), timedelta(seconds=1)
+        return {
+            "id": self.policy_id,
+            "account_currency": self.account_currency.value,
+            "limits": {
+                "risk_per_trade_pct": d(self.risk_per_trade),
+                "max_open_risk_pct": d(self.max_open_risk),
+                "max_open_positions": self.max_open_positions,
+                "max_positions_per_pair": self.max_positions_per_pair,
+                "max_new_trades_per_day": self.max_new_trades_per_day,
+                "max_effective_leverage": d(self.max_effective_leverage),
+                "max_margin_utilisation_pct": d(self.max_margin_utilisation),
+            },
+            "loss_limits": {
+                "daily_pct": d(self.daily_loss),
+                "weekly_pct": d(self.weekly_loss),
+                "monthly_pct": d(self.monthly_loss),
+                "max_drawdown_pct": d(self.max_drawdown),
+            },
+            "drawdown_throttle": [
+                {"drawdown_pct": d(s.drawdown), "risk_multiplier": d(s.risk_multiplier)}
+                for s in self.drawdown_throttle
+            ],
+            "streaks": {
+                "cooldown_after_consecutive_losses": self.cooldown_after_consecutive_losses,
+                "cooldown_hours": whole(self.cooldown, hour, "cooldown"),
+                "halt_after_consecutive_losses": self.halt_after_consecutive_losses,
+            },
+            "exposure": {
+                "max_currency_net_risk_pct": d(self.max_currency_net_risk),
+                "max_gap_loss_pct": d(self.max_gap_loss),
+                "gap_atr_multiple_normal": d(self.gap_atr_multiple_normal),
+                "gap_atr_multiple_event": d(self.gap_atr_multiple_event),
+            },
+            "trade_quality": {
+                "min_rr_net": d(self.min_rr_net),
+                "min_stop_atr_h1": d(self.min_stop_atr_h1),
+                "max_stop_atr_h1": d(self.max_stop_atr_h1),
+                "min_stop_spread_multiple": d(self.min_stop_spread_multiple),
+                "expected_slippage_pips": d(self.expected_slippage_pips),
+                "max_entry_drift_atr": d(self.max_entry_drift_atr),
+                "signal_ttl_minutes": whole(self.signal_ttl, minute, "signal_ttl"),
+                "max_hold_horizon_hours": whole(self.max_hold_horizon, hour, "max_hold_horizon"),
+            },
+            "market": {
+                "max_spread_ratio": d(self.max_spread_ratio),
+                "max_news_risk_score": d(self.max_news_risk_score),
+                "min_calendar_sources": self.min_calendar_sources,
+                "blackout_minutes": {
+                    "tier1_before": whole(self.blackout_tier1_before, minute, "blackout"),
+                    "tier1_after": whole(self.blackout_tier1_after, minute, "blackout"),
+                    "central_bank_before": whole(
+                        self.blackout_central_bank_before, minute, "blackout"
+                    ),
+                    "central_bank_after": whole(
+                        self.blackout_central_bank_after, minute, "blackout"
+                    ),
+                    "tier2_before": whole(self.blackout_tier2_before, minute, "blackout"),
+                    "tier2_after": whole(self.blackout_tier2_after, minute, "blackout"),
+                },
+                "rollover": {
+                    "start": hhmm(self.rollover_start, "rollover_start"),
+                    "end": hhmm(self.rollover_end, "rollover_end"),
+                    "tz": self.rollover_tz,
+                },
+                "friday_no_new_entries_after_utc": hhmm(self.friday_cutoff_utc, "friday_cutoff"),
+            },
+            "data_freshness_seconds": {
+                "price": whole(self.max_price_age, second, "max_price_age"),
+                "market_snapshot": whole(self.max_market_snapshot_age, second, "freshness"),
+                "account": whole(self.max_account_age, second, "freshness"),
+                "calendar": whole(self.max_calendar_age, second, "freshness"),
+                "news": whole(self.max_news_age, second, "freshness"),
+                "reconciliation": whole(self.max_reconciliation_age, second, "freshness"),
+                "max_clock_skew": whole(self.max_clock_skew, second, "freshness"),
+            },
+            "execution": {
+                "approval_ttl_seconds": whole(self.approval_ttl, second, "approval_ttl"),
+                "require_broker_side_stop": self.require_broker_side_stop,
+                "live_micro_risk_multiplier": d(self.live_micro_risk_multiplier),
+            },
+        }
+
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> RiskPolicy:
         reader = _Reader(data, "")
