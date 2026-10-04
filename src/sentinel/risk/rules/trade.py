@@ -88,7 +88,7 @@ def size_valid(ctx: Context) -> Check:
 def leverage_and_margin(ctx: Context) -> Check:
     acct, p = ctx.account_ccy, ctx.policy
     legs = [(pos.symbol, pos.units) for pos in ctx.positions]
-    legs.append((ctx.candidate.symbol, ctx.new_units))
+    legs.append((ctx.candidate.symbol, ctx.limit_units))
     notional = Decimal(0)
     margin = Decimal(0)
     for symbol, units in legs:

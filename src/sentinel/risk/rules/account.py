@@ -25,7 +25,7 @@ def _period_loss(
         if start <= 0:
             raise MissingInput(f"positive {label} start equity")
         realised = max(Decimal(0), start - ctx.equity)
-        after = (realised + ctx.prospective_risk) / start * 100
+        after = (realised + ctx.limit_risk) / start * 100
         limit = limit_of(ctx.policy).value
         return Check(
             after <= limit,

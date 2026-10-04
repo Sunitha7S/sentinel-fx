@@ -28,7 +28,7 @@ def currency_exposure(ctx: Context, *, include_candidate: bool = True) -> dict[C
         (p.symbol, p.side, p.risk_amount.amount) for p in ctx.positions
     ]
     if include_candidate:
-        legs.append((ctx.candidate.symbol, ctx.candidate.side, ctx.prospective_risk))
+        legs.append((ctx.candidate.symbol, ctx.candidate.side, ctx.limit_risk))
     for symbol, side, risk in legs:
         inst = ctx.instrument_for(symbol)
         pct = ctx.pct_of_equity(risk)
@@ -68,7 +68,7 @@ def currency_net_risk(ctx: Context) -> Check:
 
 def total_open_risk(ctx: Context) -> Check:
     existing = sum((p.risk_amount.amount for p in ctx.positions), Decimal(0))
-    total = ctx.pct_of_equity(existing + ctx.prospective_risk)
+    total = ctx.pct_of_equity(existing + ctx.limit_risk)
     limit = ctx.policy.max_open_risk.value
     return Check(
         total <= limit,
@@ -109,7 +109,7 @@ def gap_scenario(ctx: Context) -> Check:
     legs = [
         (pos.symbol, pos.units, pos.risk_amount.amount, ctx.horizon_end()) for pos in ctx.positions
     ]
-    legs.append((ctx.candidate.symbol, ctx.new_units, ctx.prospective_risk, ctx.hold_end()))
+    legs.append((ctx.candidate.symbol, ctx.limit_units, ctx.limit_risk, ctx.hold_end()))
     total = Decimal(0)
     for symbol, units, risk, until in legs:
         inst = ctx.instrument_for(symbol)

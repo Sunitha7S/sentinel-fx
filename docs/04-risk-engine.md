@@ -143,6 +143,11 @@ units              = floor(units_raw / unit_step) × unit_step           # ALWAY
 if units < min_units: BLOCK R-TRD-04 (never round up)
 ```
 
+**Limit checks use the maximum size, not this one (ADR 0013).** The loss-limit, exposure,
+total-risk, gap and leverage rules judge the trade at `equity × min(risk_per_trade, cap)`,
+before the throttle, the mode multiplier, costs and rounding. A size reduction therefore never
+lets a trade slip under a limit it would otherwise breach. The size above is what is approved.
+
 Worked examples (USD account, equity 10,000, 0.5% risk = $50):
 - **EURUSD long**, entry 1.0850, SL 1.0820 (30 pips) + 1.2 pips spread/slippage → 0.00312 USD/unit → **16,025 units**
 - **USDJPY short**, entry 149.50, SL 150.10 (60 pips) + 1.5 → 0.615 JPY/unit ÷ 149.50 = 0.004114 USD/unit → **12,154 units**
