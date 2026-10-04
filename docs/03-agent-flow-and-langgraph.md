@@ -16,7 +16,7 @@ Human operator
                ├── Portfolio Check (Agent 9)  (veto)
                └── Signal Validation (Agent 6)  (veto)
                      └── Signal Generation (Agent 5)  (proposes only)
-Perception (Agents 1,2,3,4) — inform; can trigger NO_NEW_TRADES via circuit breakers / tripwires
+Perception (Agents 1,2,3,4) — inform; can trigger HALTED via circuit breakers, feed failures, calendar disagreement; tripwires block the affected currency
 Learning (Agent 8) — proposes to humans; zero runtime authority
 Execution (Agent 10) — acts only with 3 fresh approvals + its own re-check
 ```
@@ -68,11 +68,11 @@ sequenceDiagram
 ### 1.3 Continuous (non-graph) flows
 | Flow | Cadence | Can it change trading state? |
 |---|---|---|
-| Price stream → circuit breaker | per tick | Yes → `NO_NEW_TRADES` (auto-clears after 30 min of normal conditions, unless the trigger was `multi_pair_jump`, which needs a human) |
+| Price stream → circuit breaker | per tick | Yes → `HALTED`. No auto-clear: resuming needs human review (automatic changes may only tighten) |
 | Calendar refresh | 15 min (1 min within 2h of a tier-1 event) | Yes, on stale feed or source disagreement |
 | News poll / stream | 30s–2 min per source | Yes, on a tripwire hit (currency-scoped) |
 | Portfolio health | 60s | Yes, on `CRITICAL` or a loss-limit breach |
-| Reconciliation | 60s, and at startup | Yes, on mismatch → `NO_NEW_TRADES` + incident |
+| Reconciliation | 60s, and at startup | Yes, on mismatch → `HALTED` + incident |
 | Position manager | M5 close | No state change; manages stops per ruleset |
 | Session plan | 21:30 UTC daily + hourly refresh | No |
 | Learning jobs | nightly / weekly / monthly | **Never** |
