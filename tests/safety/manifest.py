@@ -36,8 +36,17 @@ REQUIRED_INVARIANTS: dict[str, str] = {
     "INV-SHADOW-01": "Every candidate is persisted as a shadow trade.",
     "INV-LLM-01": "LLM output can only add caution; it cannot loosen any decision.",
     "INV-LLM-02": "LLM-facing code cannot reach trading state, policy or execution.",
-    "INV-POLICY-01": "Learning cannot modify protected risk policy.",
+    "INV-POLICY-01": (
+        "Learning cannot modify protected risk policy (code capability and database grants)."
+    ),
     "INV-POLICY-02": "Loosening needs human approval and cooling-off; code ceilings hold.",
     "INV-STATE-01": "Automatic transitions only tighten; every transition is audited.",
+    "INV-DB-ROLES": (
+        "Database roles have no dangerous attributes, own nothing, and hold exactly the "
+        "privileges in sentinel.store.postgres.permissions."
+    ),
+    "INV-DB-APPEND-ONLY": (
+        "UPDATE, DELETE and TRUNCATE are refused on append-only tables even for the owner."
+    ),
     "INV-EXEC-01": "Execution is disabled; live trading needs explicit, consistent enabling.",
 }

@@ -34,7 +34,9 @@ jobs:
       - run: uv run lint-imports
 
   tests:
-    name: tests + coverage (${{ matrix.os }})
+    # Everything that does not need PostgreSQL, on both operating systems. The coverage
+    # gate runs in the `database` job, which executes the complete suite.
+    name: tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -46,12 +48,56 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync
-      - name: full suite with coverage gate
+      - run: uv run pytest -m "not db" -q
+
+  database:
+    # Complete suite against PostgreSQL 16, with the coverage gate. SENTINEL_REQUIRE_DB=1
+    # turns an unreachable database into a failure instead of a skip.
+    name: database
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      SENTINEL_TEST_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/postgres
+      SENTINEL_REQUIRE_DB: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync
+      - name: migrations apply, roll back and re-apply cleanly
+        env:
+          SENTINEL_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/postgres
+        run: |
+          uv run alembic upgrade head
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+      - name: complete suite with coverage gate
         run: uv run pytest --cov --cov-report=term-missing --cov-report=xml
 
   safety:
     name: safety invariants (must exist and pass)
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      SENTINEL_TEST_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/postgres
+      SENTINEL_REQUIRE_DB: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6

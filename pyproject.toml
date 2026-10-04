@@ -7,8 +7,12 @@ requires-python = ">=3.12"
 license = { text = "Proprietary" }
 authors = [{ name = "Sunitha" }]
 dependencies = [
+    "alembic>=1.13",
+    "httpx>=0.27",
+    "psycopg[binary]>=3.2",
     "pydantic>=2.9",
     "pyyaml>=6.0",
+    "sqlalchemy>=2.0.30",
     "tzdata>=2024.1",
 ]
 
@@ -68,11 +72,14 @@ known-local-folder = ["safety", "support"]
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "PLR0915", "PLC0415"]
 "src/sentinel/cli.py" = ["T201"]
+# SQL there is assembled only from fixed identifier lists (roles, tables), never from input.
+"migrations/**" = ["S608"]
+"tests/db/**" = ["S608"]
 
 # ---------------------------------------------------------------- mypy
 [tool.mypy]
 python_version = "3.12"
-files = ["src", "tests"]
+files = ["src", "tests", "migrations"]
 mypy_path = ["src", "tests"]
 explicit_package_bases = true
 strict = true
@@ -88,6 +95,7 @@ pythonpath = ["tests"]
 addopts = ["--import-mode=importlib", "--strict-markers", "--strict-config", "-ra"]
 markers = [
     "invariant(id): test enforces a named safety invariant from tests/safety/manifest.py",
+    "db: needs PostgreSQL via SENTINEL_TEST_DATABASE_URL (applied automatically under tests/db)",
 ]
 filterwarnings = ["error"]
 
