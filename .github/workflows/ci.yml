@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_FROZEN: "1"
+  HYPOTHESIS_PROFILE: ci
+
+jobs:
+  static:
+    name: lint, format, types, layering
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+      - run: uv run lint-imports
+
+  tests:
+    name: tests + coverage (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync
+      - name: full suite with coverage gate
+        run: uv run pytest --cov --cov-report=term-missing --cov-report=xml
+
+  safety:
+    name: safety invariants (must exist and pass)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync
+      # Runs only tests marked @pytest.mark.invariant. tests/safety/test_manifest.py fails
+      # if any invariant listed in tests/safety/manifest.py has no marked test, so an
+      # invariant cannot be dropped silently by deleting its tests.
+      - run: uv run pytest -m invariant -q
