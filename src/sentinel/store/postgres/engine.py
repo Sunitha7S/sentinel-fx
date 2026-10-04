@@ -28,9 +28,10 @@ def role_engine(url: str, role: str | None = None, **kwargs: object) -> Engine:
     session to one group via ``SET ROLE`` at connection start. Privileges are then exactly
     those of that group.
     """
-    connect_args: dict[str, object] = {}
+    # Sessions always run in UTC, so timestamps come back as UTC whatever the server's zone.
+    options = ["-c timezone=UTC"]
     if role is not None:
         if role not in (*SERVICE_ROLES, OWNER_ROLE):
             raise ValueError(f"unknown database role {role!r}")
-        connect_args["options"] = f"-c role={role}"
-    return create_engine(url, connect_args=connect_args, **kwargs)
+        options.append(f"-c role={role}")
+    return create_engine(url, connect_args={"options": " ".join(options)}, **kwargs)

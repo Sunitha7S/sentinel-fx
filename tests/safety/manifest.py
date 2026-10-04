@@ -41,6 +41,10 @@ REQUIRED_INVARIANTS: dict[str, str] = {
     ),
     "INV-POLICY-02": "Loosening needs human approval and cooling-off; code ceilings hold.",
     "INV-STATE-01": "Automatic transitions only tighten; every transition is audited.",
+    "INV-POLICY-IMMUTABLE": (
+        "Policy versions are immutable; activation is append-only and linear; decisions "
+        "reference the exact policy hash; no service role can replace policy history."
+    ),
     "INV-DB-ROLES": (
         "Database roles have no dangerous attributes, own nothing, and hold exactly the "
         "privileges in sentinel.store.postgres.permissions."
