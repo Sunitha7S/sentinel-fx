@@ -198,6 +198,7 @@ APPEND_ONLY = (
     "market_candles",
     "spreads",
     "ingestion_runs",
+    "market_series",
 )
 
 
@@ -222,6 +223,7 @@ def _some_column(table: str) -> str:
         "market_candles": "source",
         "spreads": "source",
         "ingestion_runs": "provider",
+        "market_series": "source",
         "policy_versions": "created_by",
     }.get(table, "recorded_at")
 

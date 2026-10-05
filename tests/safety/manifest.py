@@ -56,5 +56,9 @@ REQUIRED_INVARIANTS: dict[str, str] = {
         "Market-data providers can only issue GET requests for historical candles on the "
         "practice host; order, account and streaming endpoints are unreachable."
     ),
+    "INV-MD-SINGLE-SOURCE": (
+        "A market-data series has exactly one source: rows from any other source are refused "
+        "by the database for every role, and only an owner-controlled trigger registers series."
+    ),
     "INV-EXEC-01": "Execution is disabled; live trading needs explicit, consistent enabling.",
 }
