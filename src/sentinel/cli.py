@@ -8,6 +8,8 @@ Inspection (M1):
 
 Data layer (M2; database URL from ``SENTINEL_DATABASE_URL``):
 
+* ``sentinel provider-check``  small fixed read-only probes; verdict and next step before any
+  bulk ingestion. Needs only ``SENTINEL_OANDA_TOKEN``; never touches the database
 * ``sentinel ingest --symbols EUR_USD,USD_JPY --timeframes M1,H1,H4,D1 --from 2015-01-01``
   read-only historical ingestion (OANDA practice; token from ``SENTINEL_OANDA_TOKEN``)
 * ``sentinel data-report [--output FILE]``         completeness, gaps, spreads, runs
@@ -21,7 +23,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -31,7 +33,8 @@ from sentinel.config.policy_loader import load_policy
 from sentinel.config.settings import SettingsError, load_settings
 from sentinel.domain.market_data import Timeframe
 from sentinel.execution.guard import execution_refusals
-from sentinel.perception.market_data import oanda
+from sentinel.perception.market_data import connectivity, oanda
+from sentinel.perception.market_data.connectivity import CheckStatus
 from sentinel.perception.market_data.ingest import ingest
 from sentinel.perception.market_data.provider import ProviderError
 from sentinel.risk.policy import PolicyViolation
@@ -54,6 +57,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     settings = sub.add_parser("settings", help="show effective settings and execution status")
     settings.add_argument("--env", default=None)
+
+    check = sub.add_parser("provider-check", help="verify read access to the history M2.1 needs")
+    check.add_argument("--provider", choices=["oanda"], default="oanda")
 
     ingest = sub.add_parser("ingest", help="read-only historical candle ingestion")
     ingest.add_argument("--provider", choices=["oanda"], default="oanda")
@@ -83,6 +89,27 @@ def _database_url() -> str | None:
     if not url:
         print("SENTINEL_DATABASE_URL is not set", file=sys.stderr)
     return url
+
+
+_CHECK_EXIT = {CheckStatus.OK: 0, CheckStatus.ACCESS_DENIED: 3}
+
+
+def _provider_check() -> int:
+    token = os.environ.get("SENTINEL_OANDA_TOKEN", "")
+    if not token.strip():
+        print(
+            "SENTINEL_OANDA_TOKEN is not set: create an OANDA *practice* API token and set it "
+            "in this shell (never commit it). No request was made.",
+            file=sys.stderr,
+        )
+        return 2
+    provider = oanda.OandaProvider(token)
+    try:
+        result = connectivity.check_provider(provider, connectivity.DEFAULT_PROBES)
+    finally:
+        provider.close()
+    print(connectivity.render_check(result))
+    return _CHECK_EXIT.get(result.verdict, 1)
 
 
 def _ingest(args: argparse.Namespace) -> int:
@@ -181,18 +208,20 @@ def _settings(env: str | None) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.command == "policy-hash":
-        return _policy_hash(args.path)
-    if args.command == "audit-verify":
-        return _audit_verify(args.path)
-    if args.command == "settings":
-        return _settings(args.env)
-    if args.command == "ingest":
-        return _ingest(args)
-    if args.command in ("data-report", "db-security-report"):
-        return _report(args)
-    parser.print_help(sys.stdout)
-    return 0
+    handlers: dict[str, Callable[[], int]] = {
+        "policy-hash": lambda: _policy_hash(args.path),
+        "audit-verify": lambda: _audit_verify(args.path),
+        "settings": lambda: _settings(args.env),
+        "provider-check": _provider_check,
+        "ingest": lambda: _ingest(args),
+        "data-report": lambda: _report(args),
+        "db-security-report": lambda: _report(args),
+    }
+    handler = handlers.get(args.command or "")
+    if handler is None:
+        parser.print_help(sys.stdout)
+        return 0
+    return handler()
 
 
 if __name__ == "__main__":  # pragma: no cover

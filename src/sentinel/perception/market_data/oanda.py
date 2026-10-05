@@ -25,6 +25,7 @@ from sentinel.domain.market_data import OHLC, Candle, Timeframe
 from sentinel.domain.types import DomainError
 from sentinel.perception.market_data.provider import (
     CandleBatch,
+    ProviderAccessDenied,
     ProviderError,
     ProviderUnavailable,
     ReadOnlyViolation,
@@ -125,9 +126,10 @@ class OandaProvider:
                 self._sleep(0.5 * 2**attempt)
                 continue
             if response.status_code in (401, 403):
-                raise ProviderUnavailable(
+                raise ProviderAccessDenied(
                     f"OANDA refused the request (HTTP {response.status_code}): check the "
-                    "practice token and that the account's region has API access"
+                    "practice token and that the account's region has API access",
+                    status_code=response.status_code,
                 )
             if response.status_code in _RETRYABLE and attempt < self._max_retries:
                 self._sleep(0.5 * 2**attempt)
