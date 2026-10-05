@@ -25,6 +25,7 @@ TABLES: Final = (
     "spreads",
     "ingestion_runs",
     "market_series",
+    "dataset_snapshots",
 )
 
 _R = frozenset({"SELECT"})
@@ -33,7 +34,8 @@ _NONE: frozenset[str] = frozenset()
 
 # role -> table -> privileges. Anything absent is denied. No role has UPDATE, DELETE,
 # TRUNCATE, REFERENCES or TRIGGER on any table, and none owns a table. ``market_series`` is
-# read-only for everyone: only an owner-controlled trigger registers a series (ADR 0014).
+# read-only for everyone: only an owner-controlled trigger registers a series. Only
+# ``svc_market_data`` freezes ``dataset_snapshots`` (ADR 0014).
 EXPECTED: Final[dict[str, dict[str, frozenset[str]]]] = {
     "human_admin": {
         "policy_versions": _RW,
@@ -47,6 +49,7 @@ EXPECTED: Final[dict[str, dict[str, frozenset[str]]]] = {
         "spreads": _R,
         "ingestion_runs": _R,
         "market_series": _R,
+        "dataset_snapshots": _R,
     },
     "svc_risk": {
         "policy_versions": _R,
@@ -58,6 +61,7 @@ EXPECTED: Final[dict[str, dict[str, frozenset[str]]]] = {
         "spreads": _R,
         "ingestion_runs": _R,
         "market_series": _R,
+        "dataset_snapshots": _R,
     },
     "svc_learning": {
         "policy_versions": _R,
@@ -69,6 +73,7 @@ EXPECTED: Final[dict[str, dict[str, frozenset[str]]]] = {
         "spreads": _R,
         "ingestion_runs": _R,
         "market_series": _R,
+        "dataset_snapshots": _R,
     },
     "svc_audit": {
         "policy_versions": _R,
@@ -86,12 +91,14 @@ EXPECTED: Final[dict[str, dict[str, frozenset[str]]]] = {
         "spreads": _R,
         "ingestion_runs": _R,
         "market_series": _R,
+        "dataset_snapshots": _R,
     },
     "svc_market_data": {
         "market_candles": _RW,
         "spreads": _RW,
         "ingestion_runs": _RW,
         "market_series": _R,
+        "dataset_snapshots": _RW,
     },
 }
 
