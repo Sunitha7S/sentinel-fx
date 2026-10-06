@@ -3,6 +3,7 @@
 Inspection (M1):
 
 * ``sentinel policy-hash PATH``   validate a policy file against code ceilings, print its hash
+* ``sentinel quality-hash PATH``  validate a data-quality configuration, print its identity
 * ``sentinel audit-verify PATH``  verify a JSON-lines audit chain
 * ``sentinel settings [--env E]`` show effective settings and whether execution is permitted
 
@@ -30,8 +31,10 @@ from pathlib import Path
 from sentinel import __version__
 from sentinel.audit.chain import AuditChainError, verify_chain
 from sentinel.config.policy_loader import load_policy
+from sentinel.config.quality_loader import load_quality_config
 from sentinel.config.settings import SettingsError, load_settings
 from sentinel.domain.market_data import Timeframe
+from sentinel.domain.quality import QualityConfigError
 from sentinel.execution.guard import execution_refusals
 from sentinel.perception.market_data import connectivity, oanda
 from sentinel.perception.market_data.connectivity import CheckStatus
@@ -51,6 +54,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     policy = sub.add_parser("policy-hash", help="validate a risk policy file and print its hash")
     policy.add_argument("path", type=Path)
+
+    quality = sub.add_parser(
+        "quality-hash", help="validate a data-quality configuration and print its hash"
+    )
+    quality.add_argument("path", type=Path)
 
     audit = sub.add_parser("audit-verify", help="verify a JSON-lines audit chain")
     audit.add_argument("path", type=Path)
@@ -181,6 +189,16 @@ def _policy_hash(path: Path) -> int:
     return 0
 
 
+def _quality_hash(path: Path) -> int:
+    try:
+        config = load_quality_config(path)
+    except QualityConfigError as exc:
+        print(f"INVALID: {exc}", file=sys.stderr)
+        return 1
+    print(f"{config.version} {config.status} {config.sha256}")
+    return 0
+
+
 def _audit_verify(path: Path) -> int:
     try:
         count = verify_chain(JsonlAuditSink(path))
@@ -210,6 +228,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     handlers: dict[str, Callable[[], int]] = {
         "policy-hash": lambda: _policy_hash(args.path),
+        "quality-hash": lambda: _quality_hash(args.path),
         "audit-verify": lambda: _audit_verify(args.path),
         "settings": lambda: _settings(args.env),
         "provider-check": _provider_check,
