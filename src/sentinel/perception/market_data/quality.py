@@ -19,15 +19,14 @@ so their completeness is measured per trading week instead (30 H4 or 5 D1 bars).
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-from zoneinfo import ZoneInfo
 
+from sentinel.domain.calendar import NEW_YORK, expected_bars, is_holiday_closure
 from sentinel.domain.market_data import Timeframe
 from sentinel.domain.types import require_utc
-from sentinel.risk.sessions import market_closed
 
 __all__ = [
     "Gap",
@@ -39,31 +38,7 @@ __all__ = [
     "is_holiday_closure",
 ]
 
-NEW_YORK = ZoneInfo("America/New_York")
-_HOLIDAYS = ((12, 25), (1, 1))
 _PER_WEEK = {Timeframe.H4: 30, Timeframe.D1: 5}
-
-
-def is_holiday_closure(ts: datetime) -> bool:
-    ny = ts.astimezone(NEW_YORK)
-    return (ny.month, ny.day) in _HOLIDAYS
-
-
-def _expected(ts: datetime) -> bool:
-    return not market_closed(ts) and not is_holiday_closure(ts)
-
-
-def expected_bars(timeframe: Timeframe, start: datetime, end: datetime) -> Iterator[datetime]:
-    """Open times of every bar the market should produce in [start, end)."""
-    if not timeframe.fixed_utc_grid:
-        raise ValueError(f"{timeframe} is not on a fixed UTC grid; use analyse_weekly")
-    step = timeframe.duration
-    epoch = datetime(2000, 1, 3, tzinfo=start.tzinfo)
-    t = start + (-(start - epoch)) % step  # first grid point >= start
-    while t < end:
-        if _expected(t):
-            yield t
-        t += step
 
 
 @dataclass(frozen=True, slots=True)

@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
+from sentinel.domain.calendar import NEW_YORK, WEEKLY_EDGE, market_closed
+
 __all__ = [
     "after_friday_cutoff",
     "crosses_weekly_close",
@@ -13,11 +15,7 @@ __all__ = [
     "next_weekly_close",
 ]
 
-NEW_YORK = ZoneInfo("America/New_York")
-WEEKLY_EDGE = time(17, 0)
-"""Spot FX closes on Friday and reopens on Sunday at 17:00 New York time."""
-
-_FRIDAY, _SATURDAY, _SUNDAY = 4, 5, 6
+_FRIDAY = 4
 
 
 def in_local_window(at: datetime, start: time, end: time, tz: str) -> bool:
@@ -26,16 +24,6 @@ def in_local_window(at: datetime, start: time, end: time, tz: str) -> bool:
     if start <= end:
         return start <= local < end
     return local >= start or local < end
-
-
-def market_closed(at: datetime) -> bool:
-    ny = at.astimezone(NEW_YORK)
-    t = ny.time().replace(tzinfo=None)
-    return (
-        ny.weekday() == _SATURDAY
-        or (ny.weekday() == _FRIDAY and t >= WEEKLY_EDGE)
-        or (ny.weekday() == _SUNDAY and t < WEEKLY_EDGE)
-    )
 
 
 def next_weekly_close(at: datetime) -> datetime:
