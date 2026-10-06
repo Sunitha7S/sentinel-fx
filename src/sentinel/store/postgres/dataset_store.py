@@ -244,8 +244,11 @@ class PostgresDatasetStore:
 
     @staticmethod
     def _stream(conn: Connection, spec: DatasetSpec) -> Iterator[Candle]:
-        result = conn.execution_options(stream_results=True, max_row_buffer=10_000).execute(
-            _ROWS, _params(spec)
+        # Streaming is set on this statement only. Connection.execution_options() would make
+        # every later statement on the connection use a server-side cursor too, and the
+        # INSERT ... RETURNING that freeze() runs next cannot be declared as a cursor.
+        result = conn.execute(
+            _ROWS.execution_options(stream_results=True, max_row_buffer=10_000), _params(spec)
         )
         for row in result:
             if row.source != spec.source:
