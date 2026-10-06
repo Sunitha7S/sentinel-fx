@@ -16,7 +16,8 @@ override.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterator
+from collections.abc import Generator
+from contextlib import closing
 from datetime import UTC
 from typing import Any, Final
 
@@ -156,8 +157,9 @@ class PostgresDatasetStore:
             if duplicate is not None:
                 raise DatasetError(f"this range is already frozen as snapshot {duplicate}")
             digester = DatasetDigester(spec)
-            for c in self._stream(conn, spec):
-                digester.add(c)
+            with closing(self._stream(conn, spec)) as candles:
+                for c in candles:
+                    digester.add(c)
             digest = digester.finish()
             if digest.rows > self._max_rows:
                 raise DatasetError(
@@ -227,7 +229,8 @@ class PostgresDatasetStore:
                     f"snapshot {record.snapshot_id}: source mismatch (snapshot "
                     f"{record.spec.source}, series registered to {registered})"
                 )
-            return issue_verified_dataset(record, self._stream(conn, record.spec))
+            with closing(self._stream(conn, record.spec)) as candles:
+                return issue_verified_dataset(record, candles)
 
     def list(self) -> list[SnapshotRecord]:
         """Snapshot records (metadata only). Rows are available solely through ``load``."""
@@ -243,17 +246,19 @@ class PostgresDatasetStore:
     # ------------------------------------------------------------------ rows
 
     @staticmethod
-    def _stream(conn: Connection, spec: DatasetSpec) -> Iterator[Candle]:
+    def _stream(conn: Connection, spec: DatasetSpec) -> Generator[Candle]:
         # Streaming is set on this statement only. Connection.execution_options() would make
         # every later statement on the connection use a server-side cursor too, and the
         # INSERT ... RETURNING that freeze() runs next cannot be declared as a cursor.
-        result = conn.execute(
+        # The result is closed on every exit path; callers wrap this generator in closing()
+        # so an error while consuming it releases the server-side cursor immediately.
+        with conn.execute(
             _ROWS.execution_options(stream_results=True, max_row_buffer=10_000), _params(spec)
-        )
-        for row in result:
-            if row.source != spec.source:
-                raise DatasetError(
-                    f"source mismatch at {row.ts.isoformat()}: row from {row.source}, "
-                    f"snapshot source {spec.source}"
-                )
-            yield _candle(row)
+        ) as result:
+            for row in result:
+                if row.source != spec.source:
+                    raise DatasetError(
+                        f"source mismatch at {row.ts.isoformat()}: row from {row.source}, "
+                        f"snapshot source {spec.source}"
+                    )
+                yield _candle(row)
