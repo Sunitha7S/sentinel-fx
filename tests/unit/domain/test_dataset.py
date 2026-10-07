@@ -25,18 +25,22 @@ from sentinel.domain.dataset import (
     QualityProvenance,
     SnapshotRecord,
     VerifiedDataset,
+    attest,
     digest_candles,
     issue_verified_dataset,
+    judge_dataset,
 )
 from sentinel.domain.market_data import OHLC, Candle, Timeframe
 from sentinel.domain.types import DomainError
 
 from support.market import candle, minutes
+from support.quality import lenient_config, quality_config
 
 MON = datetime(2015, 1, 5, tzinfo=UTC)
 SPEC = DatasetSpec("EUR_USD", Timeframe.M1, "oanda-practice", MON, MON + timedelta(minutes=3))
 HEX = "a" * 64
-PASS = QualityProvenance("PASS", HEX, HEX)
+CFG = lenient_config()
+AS_OF = datetime(2020, 1, 1, tzinfo=UTC)
 
 
 def _c(ts: datetime, bid: tuple[str, ...], ask: tuple[str, ...], vol: int) -> Candle:
@@ -66,15 +70,17 @@ GOLDEN = [
 ]
 
 
-def _record(spec: DatasetSpec, rows: int, rows_sha: str, sha: str) -> SnapshotRecord:
+def _record(spec: DatasetSpec = SPEC, rows: list[Candle] = GOLDEN) -> SnapshotRecord:
+    """A record exactly as freeze() would store it: digest and quality judged together."""
+    a = attest(judge_dataset(spec, CFG, AS_OF, rows))
     return SnapshotRecord(
         snapshot_id="00000000-0000-0000-0000-000000000001",
         spec=spec,
-        row_count=rows,
-        rows_sha256=rows_sha,
-        sha256=sha,
-        quality=PASS,
-        created_at=MON,
+        row_count=a.rows,
+        rows_sha256=a.rows_sha256,
+        sha256=a.sha256,
+        quality=a.provenance,
+        created_at=AS_OF,
     )
 
 
@@ -217,15 +223,14 @@ def test_provenance_digests_must_be_sha256_hex() -> None:
 
 @pytest.mark.invariant("INV-DATA-VERIFIED-ONLY")
 def test_a_verified_dataset_cannot_be_constructed_directly() -> None:
-    d = digest_candles(SPEC, GOLDEN)
     with pytest.raises(DatasetError, match="only"):
-        VerifiedDataset(_record(SPEC, d.rows, d.rows_sha256, d.sha256), tuple(GOLDEN), object())
+        VerifiedDataset(_record(), tuple(GOLDEN), object())
 
 
 @pytest.mark.invariant("INV-DATA-SNAPSHOT")
 def test_issuance_recomputes_and_matches_the_record() -> None:
     d = digest_candles(SPEC, GOLDEN)
-    ds = issue_verified_dataset(_record(SPEC, d.rows, d.rows_sha256, d.sha256), GOLDEN)
+    ds = issue_verified_dataset(_record(), GOLDEN, CFG)
     assert ds.sha256 == d.sha256
     assert ds.candles == tuple(GOLDEN)
     assert ds.spec == SPEC
@@ -242,28 +247,25 @@ def test_issuance_recomputes_and_matches_the_record() -> None:
     ],
 )
 def test_issuance_refuses_any_mismatch(field: str, value: object, match: str) -> None:
-    d = digest_candles(SPEC, GOLDEN)
-    record = replace(_record(SPEC, d.rows, d.rows_sha256, d.sha256), **{field: value})  # type: ignore[arg-type]
+    record = replace(_record(), **{field: value})  # type: ignore[arg-type]
     with pytest.raises(DatasetError, match=match):
-        issue_verified_dataset(record, GOLDEN)
+        issue_verified_dataset(record, GOLDEN, CFG)
 
 
 @pytest.mark.invariant("INV-DATA-SNAPSHOT")
 def test_issuance_refuses_missing_extra_or_foreign_rows() -> None:
-    d = digest_candles(SPEC, GOLDEN)
-    record = _record(SPEC, d.rows, d.rows_sha256, d.sha256)
+    record = _record()
     with pytest.raises(DatasetError):
-        issue_verified_dataset(record, GOLDEN[:1])  # missing row
+        issue_verified_dataset(record, GOLDEN[:1], CFG)  # missing row
     extra = _c(MON + timedelta(minutes=2), ("1.2",) * 4, ("1.2001",) * 4, 1)
     with pytest.raises(DatasetError):
-        issue_verified_dataset(record, [*GOLDEN, extra])
+        issue_verified_dataset(record, [*GOLDEN, extra], CFG)
     with pytest.raises(DatasetError):
-        issue_verified_dataset(replace(record, spec=replace(SPEC, source="other")), GOLDEN)
+        issue_verified_dataset(replace(record, spec=replace(SPEC, source="other")), GOLDEN, CFG)
 
 
 def test_verified_dataset_is_immutable() -> None:
-    d = digest_candles(SPEC, GOLDEN)
-    ds = issue_verified_dataset(_record(SPEC, d.rows, d.rows_sha256, d.sha256), GOLDEN)
+    ds = issue_verified_dataset(_record(), GOLDEN, CFG)
     with pytest.raises(AttributeError):
         ds.candles = ()  # type: ignore[misc]
     assert isinstance(ds.candles, tuple)
@@ -287,3 +289,31 @@ def test_hash_generation_throughput(capsys: pytest.CaptureFixture[str]) -> None:
             f"({n / elapsed:,.0f} candles/s)\n"
         )
     assert elapsed < 60
+
+
+# ----------------------------------------------------------------------------- quality on issuance
+
+
+@pytest.mark.invariant("INV-DATA-SNAPSHOT")
+def test_issuance_requires_the_snapshots_own_quality_configuration() -> None:
+    record = _record()
+    other = lenient_config(max_gap_bars=999)  # also lenient, also PASS, but not the same config
+    with pytest.raises(DatasetError, match="quality configuration mismatch"):
+        issue_verified_dataset(record, GOLDEN, other)
+    with pytest.raises(DatasetError, match="quality configuration mismatch"):
+        issue_verified_dataset(record, GOLDEN, quality_config())
+
+
+@pytest.mark.invariant("INV-DATA-SNAPSHOT")
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        lambda r: replace(r, quality=QualityProvenance("PASS", HEX, r.quality.config_sha256)),
+        lambda r: replace(r, created_at=r.created_at + timedelta(seconds=1)),
+    ],
+    ids=["report hash", "evaluation time"],
+)
+def test_issuance_refuses_a_quality_result_it_cannot_reproduce(tamper: object) -> None:
+    record = tamper(_record())  # type: ignore[operator]
+    with pytest.raises(DatasetError, match="quality report mismatch"):
+        issue_verified_dataset(record, GOLDEN, CFG)

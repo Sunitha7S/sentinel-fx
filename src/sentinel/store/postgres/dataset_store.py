@@ -11,17 +11,19 @@ range and row count (``check_snapshot``) and from then on refuses inserts inside
 
 ``load`` is the only way to obtain rows of a snapshot. It reads the record and the rows in a
 single read-only REPEATABLE READ transaction, refuses an unknown snapshot, a non-PASS
-verdict, an unknown format, an oversized snapshot or any source mismatch, and returns a
-``VerifiedDataset`` only if the recomputed row count and hashes are identical. There is no
-override.
+verdict, an unknown format, an oversized snapshot, any source mismatch or a quality
+configuration it does not hold (configurations are given to the store keyed by their hash;
+a snapshot is never re-judged under a different one), and returns a ``VerifiedDataset`` only
+if the recomputed row count, hashes and quality report are identical. There is no override.
 """
 
 from __future__ import annotations
 
 import uuid
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from contextlib import closing
 from datetime import UTC
+from types import MappingProxyType
 from typing import Any, Final
 
 from sqlalchemy import Connection, Engine, text
@@ -104,10 +106,19 @@ def _record(row: Any) -> SnapshotRecord:
 
 
 class PostgresDatasetStore:
-    def __init__(self, engine: Engine, *, max_rows: int = DEFAULT_MAX_ROWS) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        quality_configs: Mapping[str, QualityConfig] = MappingProxyType({}),
+        max_rows: int = DEFAULT_MAX_ROWS,
+    ) -> None:
+        """``quality_configs`` maps configuration hash to configuration; ``load`` refuses a
+        snapshot whose configuration is not among them. ``freeze`` takes its own."""
         if max_rows < 1:
             raise ValueError("max_rows must be positive")
         self._engine = engine
+        self._configs = MappingProxyType(dict(quality_configs))
         self._max_rows = max_rows
 
     @staticmethod
@@ -237,8 +248,15 @@ class PostgresDatasetStore:
                     f"snapshot {record.snapshot_id}: source mismatch (snapshot "
                     f"{record.spec.source}, series registered to {registered})"
                 )
+            quality = self._configs.get(record.quality.config_sha256)
+            if quality is None or quality.sha256 != record.quality.config_sha256:
+                raise DatasetError(
+                    f"snapshot {record.snapshot_id}: quality configuration "
+                    f"{record.quality.config_sha256} is not available; the snapshot cannot be "
+                    "verified"
+                )
             with closing(self._stream(conn, record.spec)) as candles:
-                return issue_verified_dataset(record, candles)
+                return issue_verified_dataset(record, candles, quality)
 
     def list(self) -> list[SnapshotRecord]:
         """Snapshot records (metadata only). Rows are available solely through ``load``."""

@@ -21,14 +21,17 @@ report hash, configuration hash), which verification later reproduces.
 
 Research code never reads raw candles. It receives a ``VerifiedDataset``, which only
 ``issue_verified_dataset`` can create, and only after recomputing the digest of the rows it
-was handed and finding it identical to the snapshot record (row count, rows hash, hash).
+was handed and finding it identical to the snapshot record (row count, rows hash, hash), and
+re-running the quality gates with the snapshot's own configuration (resolved by its hash,
+never the current one) at the snapshot's own evaluation time, reproducing the stored PASS
+report byte for byte.
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -390,14 +393,26 @@ class VerifiedDataset:
         return len(self.candles)
 
 
-def issue_verified_dataset(record: SnapshotRecord, candles: Iterable[Candle]) -> VerifiedDataset:
-    """Recompute the digest of ``candles`` and issue a VerifiedDataset only on an exact match."""
+def issue_verified_dataset(
+    record: SnapshotRecord, candles: Iterable[Candle], quality: QualityConfig
+) -> VerifiedDataset:
+    """Recompute the digest and the quality report of ``candles``; issue a VerifiedDataset
+    only if both match the record exactly. ``quality`` must be the configuration the record
+    names (by hash); any other is refused."""
+    if quality.sha256 != record.quality.config_sha256:
+        raise DatasetError(
+            f"snapshot {record.snapshot_id}: quality configuration mismatch (the snapshot was "
+            f"judged under {record.quality.config_sha256})"
+        )
     rows: list[Candle] = []
-    digester = DatasetDigester(record.spec)
-    for c in candles:
-        digester.add(c)
-        rows.append(c)
-    digest = digester.finish()
+
+    def kept() -> Iterator[Candle]:
+        for c in candles:
+            rows.append(c)
+            yield c
+
+    report = judge_dataset(record.spec, quality, record.created_at, kept())
+    digest = report.digest
     if digest.rows != record.row_count:
         raise DatasetError(
             f"snapshot {record.snapshot_id}: row count mismatch "
@@ -405,4 +420,9 @@ def issue_verified_dataset(record: SnapshotRecord, candles: Iterable[Candle]) ->
         )
     if digest.rows_sha256 != record.rows_sha256 or digest.sha256 != record.sha256:
         raise DatasetError(f"snapshot {record.snapshot_id}: hash mismatch")
+    if not report.passed or report.sha256 != record.quality.report_sha256:
+        raise DatasetError(
+            f"snapshot {record.snapshot_id}: quality report mismatch (verdict {report.verdict}; "
+            "the stored quality result cannot be reproduced)"
+        )
     return VerifiedDataset(record, tuple(rows), _ISSUER_KEY)
