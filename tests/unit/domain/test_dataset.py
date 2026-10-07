@@ -22,7 +22,7 @@ from sentinel.domain.dataset import (
     DatasetDigester,
     DatasetError,
     DatasetSpec,
-    QualityAttestation,
+    QualityProvenance,
     SnapshotRecord,
     VerifiedDataset,
     digest_candles,
@@ -36,7 +36,7 @@ from support.market import candle, minutes
 MON = datetime(2015, 1, 5, tzinfo=UTC)
 SPEC = DatasetSpec("EUR_USD", Timeframe.M1, "oanda-practice", MON, MON + timedelta(minutes=3))
 HEX = "a" * 64
-PASS = QualityAttestation("PASS", HEX, HEX)
+PASS = QualityProvenance("PASS", HEX, HEX)
 
 
 def _c(ts: datetime, bid: tuple[str, ...], ask: tuple[str, ...], vol: int) -> Candle:
@@ -202,14 +202,14 @@ def test_spec_is_validated(kwargs: dict[str, object]) -> None:
 
 
 @pytest.mark.parametrize("verdict", ["FAIL", "WARNING", "DEGRADED", "SOFT_FAIL", "pass", ""])
-def test_only_pass_can_be_attested(verdict: str) -> None:
+def test_a_record_can_only_name_a_pass_verdict(verdict: str) -> None:
     with pytest.raises(DatasetError, match="PASS"):
-        QualityAttestation(verdict, HEX, HEX)
+        QualityProvenance(verdict, HEX, HEX)
 
 
-def test_attestation_digests_must_be_sha256_hex() -> None:
+def test_provenance_digests_must_be_sha256_hex() -> None:
     with pytest.raises(DatasetError):
-        QualityAttestation("PASS", "not-a-hash", HEX)
+        QualityProvenance("PASS", "not-a-hash", HEX)
 
 
 # ----------------------------------------------------------------------------- VerifiedDataset

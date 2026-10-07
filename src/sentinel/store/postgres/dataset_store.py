@@ -3,7 +3,10 @@
 ``freeze`` (``svc_market_data``) runs in one transaction holding the series' exclusive
 advisory lock, so no ingestion page can be in flight or start meanwhile. It checks the
 source against the registry, requires the range to end at or before the newest stored bar,
-digests every row in the range, and stores the record; the database re-checks the source,
+then judges and digests every row in the range in one pass (``judge_dataset``) with the
+given quality configuration, at the transaction's own timestamp (``now()``, which is also
+the record's ``created_at``). Only a PASS from an APPROVED configuration is attested and
+stored, so the rows judged are exactly the rows frozen. The database re-checks the source,
 range and row count (``check_snapshot``) and from then on refuses inserts inside the range.
 
 ``load`` is the only way to obtain rows of a snapshot. It reads the record and the rows in a
@@ -25,15 +28,17 @@ from sqlalchemy import Connection, Engine, text
 
 from sentinel.domain.dataset import (
     DATASET_FORMAT,
-    DatasetDigester,
     DatasetError,
     DatasetSpec,
-    QualityAttestation,
+    QualityProvenance,
     SnapshotRecord,
     VerifiedDataset,
+    attest,
     issue_verified_dataset,
+    judge_dataset,
 )
 from sentinel.domain.market_data import OHLC, Candle, Timeframe
+from sentinel.domain.quality import QualityConfig
 
 __all__ = ["DEFAULT_MAX_ROWS", "SERIES_LOCK_CLASS", "PostgresDatasetStore"]
 
@@ -91,7 +96,7 @@ def _record(row: Any) -> SnapshotRecord:
         row_count=int(row.row_count),
         rows_sha256=row.rows_sha256,
         sha256=row.sha256,
-        quality=QualityAttestation(
+        quality=QualityProvenance(
             row.quality_verdict, row.quality_report_sha256, row.quality_config_sha256
         ),
         created_at=row.created_at.astimezone(UTC),
@@ -115,9 +120,10 @@ class PostgresDatasetStore:
 
     # ------------------------------------------------------------------ freeze
 
-    def freeze(self, spec: DatasetSpec, quality: QualityAttestation) -> SnapshotRecord:
-        if not isinstance(quality, QualityAttestation):
-            raise DatasetError("a PASS quality attestation is required")
+    def freeze(self, spec: DatasetSpec, quality: QualityConfig) -> SnapshotRecord:
+        """Judge, attest and store ``spec`` atomically. Refuses anything but a PASS."""
+        if not isinstance(quality, QualityConfig):
+            raise DatasetError("a quality configuration is required to freeze a snapshot")
         params = _params(spec)
         with self._engine.begin() as conn:
             self.lock_series_exclusive(conn, spec.symbol, spec.timeframe)
@@ -156,16 +162,15 @@ class PostgresDatasetStore:
             ).scalar_one_or_none()
             if duplicate is not None:
                 raise DatasetError(f"this range is already frozen as snapshot {duplicate}")
-            digester = DatasetDigester(spec)
+            as_of = conn.execute(text("SELECT now()")).scalar_one().astimezone(UTC)
             with closing(self._stream(conn, spec)) as candles:
-                for c in candles:
-                    digester.add(c)
-            digest = digester.finish()
-            if digest.rows > self._max_rows:
+                report = judge_dataset(spec, quality, as_of, candles)
+            if report.digest.rows > self._max_rows:
                 raise DatasetError(
-                    f"{digest.rows:,} rows exceed the snapshot limit of {self._max_rows:,}; "
-                    "freeze a shorter range"
+                    f"{report.digest.rows:,} rows exceed the snapshot limit of "
+                    f"{self._max_rows:,}; freeze a shorter range"
                 )
+            attestation = attest(report)  # refuses FAIL and unapproved configurations
             row = conn.execute(
                 text(
                     "INSERT INTO sentinel.dataset_snapshots (snapshot_id, format, symbol, "  # noqa: S608
@@ -180,15 +185,18 @@ class PostgresDatasetStore:
                     "id": uuid.uuid4(),
                     "format": DATASET_FORMAT,
                     "source": spec.source,
-                    "rows": digest.rows,
-                    "rows_sha256": digest.rows_sha256,
-                    "sha256": digest.sha256,
-                    "verdict": quality.verdict,
-                    "report": quality.report_sha256,
-                    "config": quality.config_sha256,
+                    "rows": attestation.rows,
+                    "rows_sha256": attestation.rows_sha256,
+                    "sha256": attestation.sha256,
+                    "verdict": attestation.provenance.verdict,
+                    "report": attestation.report_sha256,
+                    "config": attestation.config_sha256,
                 },
             ).one()
-        return _record(row)
+            record = _record(row)
+            if record.created_at != as_of:  # the report names as_of; load reproduces it from here
+                raise DatasetError("snapshot time differs from the quality evaluation time")
+        return record
 
     # ------------------------------------------------------------------ verified load
 

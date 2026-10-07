@@ -20,12 +20,13 @@ from psycopg import errors as pg
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
+from sentinel.config.quality_loader import QUALITY_CONFIG_DIR, load_quality_config
 from sentinel.domain.dataset import (
     DatasetError,
     DatasetSpec,
-    QualityAttestation,
     VerifiedDataset,
     digest_candles,
+    judge_dataset,
 )
 from sentinel.domain.market_data import Candle, Timeframe
 from sentinel.store.postgres.dataset_store import SERIES_LOCK_CLASS, PostgresDatasetStore
@@ -34,10 +35,13 @@ from sentinel.store.postgres.market_data_store import PostgresMarketDataStore
 
 from db.conftest import Db
 from support.market import candle, minutes
+from support.quality import lenient_config, quality_config
 
 MON = datetime(2015, 1, 5, tzinfo=UTC)
 SRC = "oanda-practice"
-PASS = QualityAttestation("PASS", "a" * 64, "b" * 64)
+PASS = lenient_config()
+"""Tests here are about storage, sealing and locking; quality gates are tested in their own
+module. Integrity gates still apply; only completeness thresholds are relaxed."""
 
 
 def _bars(n: int, start: datetime = MON, symbol: str = "EUR_USD") -> list[Candle]:
@@ -104,7 +108,8 @@ def test_freeze_then_load_reproduces_the_exact_dataset(db: Db) -> None:
         assert isinstance(loaded, VerifiedDataset)
         assert loaded.sha256 == expected.sha256
         assert [c.ts for c in loaded.candles] == minutes(MON + timedelta(minutes=5), 20)
-        assert loaded.record.quality == PASS
+        assert loaded.record.quality == record.quality
+        assert loaded.record.quality.config_sha256 == PASS.sha256
     assert [r.snapshot_id for r in ds.list()] == [record.snapshot_id]
 
 
@@ -125,6 +130,44 @@ def test_size_limit_fails_closed_on_freeze_and_load(db: Db) -> None:
         small.load(record.snapshot_id)
     with pytest.raises(DatasetError, match="limit"):
         PostgresDatasetStore(db.engine("svc_market_data"), max_rows=5).freeze(_spec(20, 29), PASS)
+
+
+# ----------------------------------------------------------------------------- quality gates
+
+
+def test_freeze_judges_the_frozen_rows_at_its_own_transaction_time(db: Db) -> None:
+    """The stored report hash is reproducible from outside: same rows, same config, and the
+    record's created_at (the transaction time the gates were evaluated at)."""
+    _, ds = _seeded(db)
+    strict = quality_config()
+    spec = _spec(0, 20)
+    record = ds.freeze(spec, strict)
+    report = judge_dataset(spec, strict, record.created_at, _bars(20))
+    assert report.passed
+    assert record.quality.report_sha256 == report.sha256
+    assert record.quality.config_sha256 == strict.sha256
+    assert (record.row_count, record.sha256) == (report.digest.rows, report.digest.sha256)
+
+
+def test_freeze_refuses_a_failing_range_and_writes_nothing(db: Db) -> None:
+    md = PostgresMarketDataStore(db.engine("svc_market_data"))
+    bars = _bars(60)
+    md.insert([*bars[:10], *bars[30:]], SRC)  # a 20-minute hole
+    ds = PostgresDatasetStore(db.engine("svc_market_data"))
+    with pytest.raises(DatasetError, match=r"FAIL.*completeness_below_min, gap_above_max"):
+        ds.freeze(_spec(0, 59), quality_config())
+    assert _snapshots(db) == 0
+    md.insert([candle("EUR_USD", MON + timedelta(minutes=60))], SRC)  # range not sealed
+
+
+def test_freeze_refuses_an_unapproved_configuration(db: Db) -> None:
+    _, ds = _seeded(db)
+    qc_v1 = load_quality_config(QUALITY_CONFIG_DIR / "qc_v1.yaml")  # PROVISIONAL / UNCALIBRATED
+    with pytest.raises(DatasetError, match="PROVISIONAL_UNCALIBRATED"):
+        ds.freeze(_spec(0, 20), qc_v1)
+    with pytest.raises(DatasetError, match="quality configuration is required"):
+        ds.freeze(_spec(0, 20), None)  # type: ignore[arg-type]
+    assert _snapshots(db) == 0
 
 
 # ----------------------------------------------------------------------------- freeze fails closed
@@ -336,7 +379,10 @@ def test_update_delete_truncate_are_refused_for_snapshots_and_sealed_rows(db: Db
 
 @pytest.mark.invariant("INV-DATA-SEALED")
 def test_freeze_waits_for_an_ingestion_in_progress_and_includes_its_rows(db: Db) -> None:
-    _, ds = _seeded(db, 20)
+    md = PostgresMarketDataStore(db.engine("svc_market_data"))
+    bars = _bars(20)
+    md.insert([*bars[:5], *bars[6:]], SRC)  # minute 5 arrives in the in-flight page
+    ds = PostgresDatasetStore(db.engine("svc_market_data"))
     writer = db.engine("svc_market_data").connect()
     tx = writer.begin()
     writer.execute(  # an ingestion page still in flight, inside the range about to be frozen
@@ -345,7 +391,7 @@ def test_freeze_waits_for_an_ingestion_in_progress_and_includes_its_rows(db: Db)
             "bid_c, ask_o, ask_h, ask_l, ask_c, tick_volume, source) VALUES "
             "('EUR_USD', 'M1', :ts, 1, 1, 1, 1, 1, 1, 1, 1, 0, :s)"
         ),
-        {"ts": MON + timedelta(minutes=5, seconds=30), "s": SRC},
+        {"ts": MON + timedelta(minutes=5), "s": SRC},
     )
     result: list[object] = []
 
@@ -365,7 +411,8 @@ def test_freeze_waits_for_an_ingestion_in_progress_and_includes_its_rows(db: Db)
     [record] = result
     assert not isinstance(record, BaseException), record
     loaded = PostgresDatasetStore(db.engine("svc_learning")).load(record.snapshot_id)  # type: ignore[attr-defined]
-    assert len(loaded) == 20  # 19 grid bars + the one that was in flight
+    assert len(loaded) == 19  # 18 committed bars + the one that was in flight
+    assert MON + timedelta(minutes=5) in [c.ts for c in loaded.candles]
 
 
 @pytest.mark.invariant("INV-DATA-SEALED")

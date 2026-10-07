@@ -12,6 +12,13 @@ hash on every machine, OS, Python version and database:
 * ``rows_sha256`` hashes the row lines; the snapshot hash covers a versioned header that
   names the format, symbol, timeframe, source, range, row count and ``rows_sha256``.
 
+Quality (engine v1, ``sentinel.domain.quality``): ``judge_dataset`` runs the quality gates
+and the digest over the *same* rows in one pass and issues a ``QualityReport`` bound to the
+dataset identity, the exact configuration and the evaluation time. Only ``attest`` turns a
+PASS report from an APPROVED configuration into a ``QualityAttestation``; neither can be
+constructed any other way. A stored record carries only the ``QualityProvenance`` (verdict,
+report hash, configuration hash), which verification later reproduces.
+
 Research code never reads raw candles. It receives a ``VerifiedDataset``, which only
 ``issue_verified_dataset`` can create, and only after recomputing the digest of the rows it
 was handed and finding it identical to the snapshot record (row count, rows hash, hash).
@@ -27,25 +34,32 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Final
 
-from sentinel.domain.canonical import canonical
+from sentinel.domain.canonical import canonical, canonical_json
 from sentinel.domain.market_data import Candle, Timeframe
+from sentinel.domain.quality import APPROVED, QualityChecker, QualityConfig, QualityResult
 from sentinel.domain.types import DomainError, require_utc
 
 __all__ = [
     "DATASET_FORMAT",
+    "QUALITY_REPORT_FORMAT",
     "DatasetDigest",
     "DatasetDigester",
     "DatasetError",
     "DatasetSpec",
     "QualityAttestation",
+    "QualityProvenance",
+    "QualityReport",
     "SnapshotRecord",
     "VerifiedDataset",
+    "attest",
     "digest_candles",
     "format_ts",
     "issue_verified_dataset",
+    "judge_dataset",
 ]
 
 DATASET_FORMAT: Final = "sentinel-dataset/v1"
+QUALITY_REPORT_FORMAT: Final = "sentinel-quality-report/v1"
 PASS: Final = "PASS"  # noqa: S105 - a quality verdict, not a credential
 _SYMBOL = re.compile(r"^[A-Z]{3}_[A-Z]{3}$")
 _SOURCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -172,15 +186,22 @@ def digest_candles(spec: DatasetSpec, candles: Iterable[Candle]) -> DatasetDiges
     return d.finish()
 
 
+# ----------------------------------------------------------------------------- quality
+
+_REPORT_KEY: Final = object()
+_ATTESTATION_KEY: Final = object()
+
+
 @dataclass(frozen=True, slots=True)
-class QualityAttestation:
-    """Evidence that the range passed the strict data-quality gates. PASS is the only verdict."""
+class QualityProvenance:
+    """The quality evidence a stored snapshot record names. Plain data: it proves nothing
+    until verification reproduces the report it names from the rows."""
 
     verdict: str
     report_sha256: str
-    """SHA-256 of the quality report the verdict came from."""
+    """SHA-256 of the canonical quality report."""
     config_sha256: str
-    """SHA-256 of the thresholds that report was judged against."""
+    """SHA-256 (identity) of the quality configuration the report was judged against."""
 
     def __post_init__(self) -> None:
         if self.verdict != PASS:
@@ -188,6 +209,139 @@ class QualityAttestation:
         for name in ("report_sha256", "config_sha256"):
             if not _HEX64.match(getattr(self, name)):
                 raise DatasetError(f"{name} must be a lowercase SHA-256 hex digest")
+
+
+@dataclass(frozen=True, slots=True)
+class QualityReport:
+    """The quality engine's judgement of exactly the rows of one dataset. Issued only by
+    ``judge_dataset``; its canonical JSON names the dataset, configuration and ``as_of``."""
+
+    spec: DatasetSpec
+    digest: DatasetDigest
+    config: QualityConfig
+    as_of: datetime
+    result: QualityResult
+    canonical_json: str
+    sha256: str
+    _key: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._key is not _REPORT_KEY:
+            raise DatasetError("a QualityReport can only be issued by judge_dataset")
+
+    @property
+    def verdict(self) -> str:
+        return self.result.verdict
+
+    @property
+    def passed(self) -> bool:
+        return self.result.passed
+
+
+def judge_dataset(
+    spec: DatasetSpec, config: QualityConfig, as_of: datetime, candles: Iterable[Candle]
+) -> QualityReport:
+    """Judge and digest ``candles`` in one pass, so the rows judged are the rows hashed.
+
+    The rows are only read. A row the digest cannot accept (out of order, outside the range,
+    another series) is refused outright: there is no dataset identity to report on.
+    """
+    as_of = require_utc(as_of, field="as_of").astimezone(UTC)
+    checker = QualityChecker(
+        config,
+        symbol=spec.symbol,
+        timeframe=spec.timeframe,
+        start=spec.start,
+        end=spec.end,
+        as_of=as_of,
+    )
+    digester = DatasetDigester(spec)
+    for c in candles:
+        checker.add(c)
+        digester.add(c)
+    digest = digester.finish()
+    result = checker.finish()
+    body = {
+        "format": QUALITY_REPORT_FORMAT,
+        "engine": config.engine,
+        "calendar": config.calendar,
+        "config": {"version": config.version, "status": config.status, "sha256": config.sha256},
+        "dataset": {
+            "format": DATASET_FORMAT,
+            "symbol": spec.symbol,
+            "timeframe": spec.timeframe.value,
+            "source": spec.source,
+            "from": format_ts(spec.start),
+            "to": format_ts(spec.end),
+            "rows": digest.rows,
+            "rows_sha256": digest.rows_sha256,
+            "sha256": digest.sha256,
+        },
+        "as_of": format_ts(as_of),
+        "result": result.canonical(),
+    }
+    text = canonical_json(body)
+    return QualityReport(
+        spec=spec,
+        digest=digest,
+        config=config,
+        as_of=as_of,
+        result=result,
+        canonical_json=text,
+        sha256=hashlib.sha256(text.encode("ascii")).hexdigest(),
+        _key=_REPORT_KEY,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class QualityAttestation:
+    """A PASS judgement bound to one dataset identity, configuration and report. Issued only
+    by ``attest``; the only thing a snapshot can be frozen with."""
+
+    spec: DatasetSpec
+    rows: int
+    rows_sha256: str
+    sha256: str
+    config_version: str
+    config_sha256: str
+    report_sha256: str
+    _key: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._key is not _ATTESTATION_KEY:
+            raise DatasetError(
+                "a QualityAttestation can only be issued by attest() from a PASS report"
+            )
+
+    @property
+    def provenance(self) -> QualityProvenance:
+        return QualityProvenance(PASS, self.report_sha256, self.config_sha256)
+
+
+def attest(report: QualityReport) -> QualityAttestation:
+    """Attest a PASS report judged against an APPROVED configuration. No other path exists."""
+    if not isinstance(report, QualityReport):
+        raise DatasetError("only a QualityReport issued by judge_dataset can be attested")
+    if not report.passed:
+        gates = ", ".join(f.gate for f in report.result.failures)
+        raise DatasetError(
+            f"quality verdict {report.verdict} ({gates}); the range cannot be frozen"
+        )
+    if report.config.status != APPROVED:
+        raise DatasetError(
+            f"quality configuration {report.config.version} is {report.config.status}; only an "
+            f"{APPROVED} configuration can attest a snapshot"
+        )
+    return QualityAttestation(
+        spec=report.spec,
+        rows=report.digest.rows,
+        rows_sha256=report.digest.rows_sha256,
+        sha256=report.digest.sha256,
+        config_version=report.config.version,
+        config_sha256=report.config.sha256,
+        report_sha256=report.sha256,
+        _key=_ATTESTATION_KEY,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,7 +353,7 @@ class SnapshotRecord:
     row_count: int
     rows_sha256: str
     sha256: str
-    quality: QualityAttestation
+    quality: QualityProvenance
     created_at: datetime
 
 
