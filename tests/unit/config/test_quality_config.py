@@ -108,6 +108,7 @@ def test_hash_ignores_line_endings_comments_key_order_and_decimal_scale() -> Non
     assert QualityConfig.from_mapping(reordered).sha256 == a.sha256
 
 
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_hash_covers_version_status_and_every_threshold() -> None:
     base = QualityConfig.from_mapping(_mapping()).sha256
     variants: list[dict[str, Any]] = []
@@ -239,6 +240,7 @@ def test_non_mapping_and_invalid_yaml_are_rejected(text: str) -> None:
         parse_quality_yaml(text)
 
 
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_registry_refuses_two_files_with_the_same_version_or_content(tmp_path: Path) -> None:
     (tmp_path / "qc_v1.yaml").write_text(TEXT, encoding="utf-8")
     (tmp_path / "copy.yaml").write_text(TEXT.replace("\n", "\r\n"), encoding="utf-8")
@@ -291,6 +293,7 @@ def test_quality_hash_command(capsys: pytest.CaptureFixture[str], tmp_path: Path
 # ----------------------------------------------------------------------------- isolation
 
 
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_research_code_cannot_load_quality_configuration(tmp_path: Path) -> None:
     """Learning, backtest, indicators and strategy may not import the loader (import-linter
     forbids ``sentinel.config`` for them; the AST scan used by INV-DATA-VERIFIED-ONLY agrees).
@@ -314,7 +317,8 @@ def test_research_code_cannot_load_quality_configuration(tmp_path: Path) -> None
         or "config/quality" in path.read_text(encoding="utf-8")
         or '"quality"' in path.read_text(encoding="utf-8")
     )
-    assert users == ["sentinel/config/quality_loader.py"]
+    # the CLI only passes the default path (qc_v1.yaml) to the loader
+    assert users == ["sentinel/cli.py", "sentinel/config/quality_loader.py"]
     loader = (src / "sentinel/config/quality_loader.py").read_text(encoding="utf-8")
     for call in (
         "write_text",

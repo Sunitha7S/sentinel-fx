@@ -141,6 +141,7 @@ def test_size_limit_fails_closed_on_freeze_and_load(db: Db) -> None:
 # ----------------------------------------------------------------------------- quality gates
 
 
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_freeze_judges_the_frozen_rows_at_its_own_transaction_time(db: Db) -> None:
     """The stored report hash is reproducible from outside: same rows, same config, and the
     record's created_at (the transaction time the gates were evaluated at)."""
@@ -155,6 +156,7 @@ def test_freeze_judges_the_frozen_rows_at_its_own_transaction_time(db: Db) -> No
     assert (record.row_count, record.sha256) == (report.digest.rows, report.digest.sha256)
 
 
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_freeze_refuses_a_failing_range_and_writes_nothing(db: Db) -> None:
     md = PostgresMarketDataStore(db.engine("svc_market_data"))
     bars = _bars(60)
@@ -166,6 +168,7 @@ def test_freeze_refuses_a_failing_range_and_writes_nothing(db: Db) -> None:
     md.insert([candle("EUR_USD", MON + timedelta(minutes=60))], SRC)  # range not sealed
 
 
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_freeze_refuses_an_unapproved_configuration(db: Db) -> None:
     _, ds = _seeded(db)
     qc_v1 = load_quality_config(QUALITY_CONFIG_DIR / "qc_v1.yaml")  # PROVISIONAL / UNCALIBRATED
@@ -177,6 +180,7 @@ def test_freeze_refuses_an_unapproved_configuration(db: Db) -> None:
 
 
 @pytest.mark.invariant("INV-DATA-SNAPSHOT")
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_load_refuses_a_snapshot_whose_quality_configuration_it_does_not_hold(db: Db) -> None:
     """Never re-judged under whatever configuration is current: only under its own."""
     _, ds = _seeded(db)
@@ -296,6 +300,7 @@ TAMPERING = [
 
 @pytest.mark.invariant("INV-DATA-SNAPSHOT")
 @pytest.mark.parametrize(("sql", "match"), TAMPERING, ids=range(len(TAMPERING)))
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_any_tampering_is_detected_on_load(db: Db, sql: str, match: str) -> None:
     _, ds = _seeded(db)
     record = ds.freeze(_spec(0, 20), PASS)

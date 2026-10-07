@@ -135,6 +135,7 @@ def _corrupt(gate: str, c: Candle) -> Candle:  # noqa: PLR0911 - one corruption 
 @pytest.mark.parametrize(
     "gate", [g for g in INTEGRITY_GATES if g not in ("not_increasing", "future_bar")]
 )
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_each_integrity_violation_fails(gate: str) -> None:
     bars = _bars(30)
     bars[10] = _corrupt(gate, bars[10])
@@ -224,6 +225,7 @@ def test_missing_bars_at_the_edges_of_the_range_are_gaps() -> None:
 # ----------------------------------------------------------------------------- flags
 
 
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_extreme_moves_are_flagged_kept_and_never_fail_by_themselves() -> None:
     """A flash crash the provider really reported must survive: flagged, not removed."""
     bars = _bars(30)
@@ -274,6 +276,7 @@ def test_largest_jumps_are_listed_largest_first() -> None:
 # ----------------------------------------------------------------------------- determinism
 
 
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_the_result_is_deterministic_and_independent_of_decimal_scale() -> None:
     bars = _bars(100)
     bars[50] = replace(bars[50], tick_volume=0)
@@ -294,6 +297,7 @@ def test_the_result_is_deterministic_and_independent_of_decimal_scale() -> None:
     assert canonical_json(r.canonical()) == canonical_json(a.canonical())
 
 
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_the_engine_never_modifies_or_drops_its_input() -> None:
     bars = _bars(30)
     bars[5] = _corrupt("crossed_quote", bars[5])
@@ -335,6 +339,7 @@ _END = MON + timedelta(minutes=_N)
 
 @given(_degradation())
 @settings(max_examples=150, deadline=None)
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_worse_data_never_turns_fail_into_pass(case: tuple[frozenset[int], ...]) -> None:
     removed, wide, more_removed, more_wide = case
     base = _judge(_series(removed, wide), config=_STRICT, end=_END)
@@ -352,6 +357,7 @@ def test_worse_data_never_turns_fail_into_pass(case: tuple[frozenset[int], ...])
     st.integers(0, 10),
 )
 @settings(max_examples=150, deadline=None)
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_tighter_thresholds_never_turn_fail_into_pass(
     removed: frozenset[int], pct: Decimal, gap: int, tighter_pct: Decimal, tighter_gap: int
 ) -> None:
@@ -367,6 +373,7 @@ def test_tighter_thresholds_never_turn_fail_into_pass(
 # ----------------------------------------------------------------------------- fail closed
 
 
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_unknown_timeframe_or_symbol_is_refused_before_judging() -> None:
     with pytest.raises(QualityConfigError, match="timeframe H4"):
         _judge(_bars(5), timeframe=Timeframe.H4)

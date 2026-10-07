@@ -47,6 +47,7 @@ def test_a_pass_report_names_the_dataset_config_and_time_it_judged() -> None:
     assert report.sha256 == hashlib.sha256(report.canonical_json.encode("ascii")).hexdigest()
 
 
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_the_report_hash_changes_with_rows_config_range_source_and_time() -> None:
     base = judge_dataset(SPEC, CFG, AS_OF, BARS).sha256
     variants = [
@@ -62,6 +63,7 @@ def test_the_report_hash_changes_with_rows_config_range_source_and_time() -> Non
     assert judge_dataset(SPEC, CFG, AS_OF, list(BARS)).sha256 == base  # deterministic
 
 
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_attestation_binds_every_identity_field() -> None:
     report = judge_dataset(SPEC, CFG, AS_OF, BARS)
     a = attest(report)
@@ -77,6 +79,7 @@ def test_attestation_binds_every_identity_field() -> None:
     assert a.provenance.report_sha256 == report.sha256
 
 
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_a_failing_range_cannot_be_attested() -> None:
     holed = BARS[:5] + BARS[25:]
     report = judge_dataset(SPEC, CFG, AS_OF, holed)
@@ -85,6 +88,7 @@ def test_a_failing_range_cannot_be_attested() -> None:
         attest(report)
 
 
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_only_an_approved_configuration_can_attest() -> None:
     provisional = quality_config(status=PROVISIONAL)
     report = judge_dataset(SPEC, provisional, AS_OF, BARS)
@@ -93,6 +97,7 @@ def test_only_an_approved_configuration_can_attest() -> None:
         attest(report)  # ...but not frozen
 
 
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_reports_and_attestations_cannot_be_constructed_directly() -> None:
     report = judge_dataset(SPEC, CFG, AS_OF, BARS)
     with pytest.raises(DatasetError, match="judge_dataset"):
@@ -119,6 +124,7 @@ def test_rows_the_digest_cannot_accept_are_refused_not_reported() -> None:
         judge_dataset(SPEC, lenient_config(), AS_OF, [])
 
 
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_judging_does_not_change_the_rows() -> None:
     rows = list(BARS)
     judge_dataset(SPEC, CFG, AS_OF, rows)

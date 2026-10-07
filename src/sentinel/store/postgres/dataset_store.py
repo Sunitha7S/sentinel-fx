@@ -33,6 +33,7 @@ from sentinel.domain.dataset import (
     DatasetError,
     DatasetSpec,
     QualityProvenance,
+    QualityReport,
     SnapshotRecord,
     VerifiedDataset,
     attest,
@@ -208,6 +209,35 @@ class PostgresDatasetStore:
             if record.created_at != as_of:  # the report names as_of; load reproduces it from here
                 raise DatasetError("snapshot time differs from the quality evaluation time")
         return record
+
+    # ------------------------------------------------------------------ strict report
+
+    def judge(self, spec: DatasetSpec, quality: QualityConfig) -> QualityReport:
+        """The report ``freeze`` would judge by, without freezing anything (read-only).
+
+        Same rows, same engine and the transaction's own time as ``as_of``; works with any
+        configuration status, so a provisional configuration can be reviewed on real data.
+        """
+        with (
+            self._engine.connect().execution_options(isolation_level="REPEATABLE READ") as conn,
+            conn.begin(),
+        ):
+            conn.execute(text("SET TRANSACTION READ ONLY"))
+            registered = conn.execute(
+                text(
+                    "SELECT source FROM sentinel.market_series "
+                    "WHERE symbol = :symbol AND timeframe = :timeframe"
+                ),
+                _params(spec),
+            ).scalar_one_or_none()
+            if registered != spec.source:
+                raise DatasetError(
+                    f"series {spec.symbol} {spec.timeframe.value} is registered to "
+                    f"{registered}, not {spec.source}"
+                )
+            as_of = conn.execute(text("SELECT now()")).scalar_one().astimezone(UTC)
+            with closing(self._stream(conn, spec)) as candles:
+                return judge_dataset(spec, quality, as_of, candles)
 
     # ------------------------------------------------------------------ verified load
 

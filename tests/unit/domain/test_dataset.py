@@ -295,6 +295,7 @@ def test_hash_generation_throughput(capsys: pytest.CaptureFixture[str]) -> None:
 
 
 @pytest.mark.invariant("INV-DATA-SNAPSHOT")
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_issuance_requires_the_snapshots_own_quality_configuration() -> None:
     record = _record()
     other = lenient_config(max_gap_bars=999)  # also lenient, also PASS, but not the same config
@@ -313,6 +314,7 @@ def test_issuance_requires_the_snapshots_own_quality_configuration() -> None:
     ],
     ids=["report hash", "evaluation time"],
 )
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_issuance_refuses_a_quality_result_it_cannot_reproduce(tamper: object) -> None:
     record = tamper(_record())  # type: ignore[operator]
     with pytest.raises(DatasetError, match="quality report mismatch"):

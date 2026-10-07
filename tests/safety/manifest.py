@@ -73,5 +73,10 @@ REQUIRED_INVARIANTS: dict[str, str] = {
         "Research code (backtest, indicators, strategy, learning) cannot reach raw market "
         "data; historical data reaches it only as a VerifiedDataset issued after verification."
     ),
+    "INV-DATA-QUALITY-GATED": (
+        "No research dataset may become a usable frozen snapshot unless the exact frozen rows "
+        "deterministically PASS the exact hashed quality configuration, and that result is "
+        "reproducible during verified load."
+    ),
     "INV-EXEC-01": "Execution is disabled; live trading needs explicit, consistent enabling.",
 }

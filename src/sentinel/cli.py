@@ -14,6 +14,10 @@ Data layer (M2; database URL from ``SENTINEL_DATABASE_URL``):
 * ``sentinel ingest --symbols EUR_USD,USD_JPY --timeframes M1,H1,H4,D1 --from 2015-01-01``
   read-only historical ingestion (OANDA practice; token from ``SENTINEL_OANDA_TOKEN``)
 * ``sentinel data-report [--output FILE]``         completeness, gaps, spreads, runs
+* ``sentinel data-gate --symbol EUR_USD --timeframe M1 --from 2015-01-01 --to 2016-01-01``
+  strict quality-gate report for one range (read-only): Markdown to stdout or ``--output``,
+  canonical JSON with ``--json``. Exit 0 PASS, 1 FAIL, 2 invalid configuration or
+  environment, 3 evaluation error
 * ``sentinel db-security-report [--output FILE]``  roles, grants, triggers vs intended matrix
 
 Database sessions are pinned to the least-privileged role for the job (``--db-role``).
@@ -31,8 +35,9 @@ from pathlib import Path
 from sentinel import __version__
 from sentinel.audit.chain import AuditChainError, verify_chain
 from sentinel.config.policy_loader import load_policy
-from sentinel.config.quality_loader import load_quality_config
+from sentinel.config.quality_loader import QUALITY_CONFIG_DIR, load_quality_config
 from sentinel.config.settings import SettingsError, load_settings
+from sentinel.domain.dataset import DatasetError, DatasetSpec
 from sentinel.domain.market_data import Timeframe
 from sentinel.domain.quality import QualityConfigError
 from sentinel.execution.guard import execution_refusals
@@ -42,9 +47,14 @@ from sentinel.perception.market_data.ingest import ingest
 from sentinel.perception.market_data.provider import ProviderError
 from sentinel.risk.policy import PolicyViolation
 from sentinel.store.audit_jsonl import JsonlAuditSink
+from sentinel.store.postgres.dataset_store import PostgresDatasetStore
 from sentinel.store.postgres.engine import role_engine
 from sentinel.store.postgres.market_data_store import PostgresMarketDataStore
-from sentinel.store.postgres.reports import data_quality_report, security_report
+from sentinel.store.postgres.reports import (
+    data_quality_report,
+    quality_gate_markdown,
+    security_report,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -76,6 +86,17 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--from", dest="start", default="2015-01-01")
     ingest.add_argument("--to", dest="end", default=None, help="default: now")
     ingest.add_argument("--db-role", default="svc_market_data")
+
+    gate = sub.add_parser("data-gate", help="strict data-quality gate report for one range")
+    gate.add_argument("--symbol", required=True)
+    gate.add_argument("--timeframe", required=True)
+    gate.add_argument("--from", dest="start", required=True)
+    gate.add_argument("--to", dest="end", required=True)
+    gate.add_argument("--source", default=None, help="default: the series' registered source")
+    gate.add_argument("--config", type=Path, default=QUALITY_CONFIG_DIR / "qc_v1.yaml")
+    gate.add_argument("--json", type=Path, default=None, help="write the canonical JSON here")
+    gate.add_argument("--output", type=Path, default=None, help="write the Markdown here")
+    gate.add_argument("--db-role", default="svc_learning")
 
     for name, role, helptext in (
         ("data-report", "svc_learning", "data-quality report from the database"),
@@ -179,6 +200,44 @@ def _report(args: argparse.Namespace) -> int:
     return 0
 
 
+GATE_PASS, GATE_FAIL, GATE_INVALID, GATE_ERROR = 0, 1, 2, 3
+
+
+def _data_gate(args: argparse.Namespace) -> int:
+    try:
+        config = load_quality_config(args.config)
+        timeframe = Timeframe(args.timeframe)
+    except (QualityConfigError, ValueError) as exc:
+        print(f"INVALID: {exc}", file=sys.stderr)
+        return GATE_INVALID
+    url = _database_url()
+    if url is None:
+        return GATE_INVALID
+    engine = role_engine(url, args.db_role)
+    try:
+        source = args.source or PostgresMarketDataStore(engine).registered_source(
+            args.symbol, timeframe
+        )
+        if source is None:
+            raise DatasetError(f"series {args.symbol} {timeframe} is not registered")
+        spec = DatasetSpec(args.symbol, timeframe, source, _utc(args.start), _utc(args.end))
+        report = PostgresDatasetStore(engine).judge(spec, config)
+    except Exception as exc:  # noqa: BLE001 - any evaluation failure is a non-PASS exit
+        print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return GATE_ERROR
+    finally:
+        engine.dispose()
+    markdown = quality_gate_markdown(report)
+    if args.json:
+        args.json.write_bytes(report.canonical_json.encode("ascii"))
+    if args.output:
+        args.output.write_text(markdown, encoding="utf-8")
+    else:
+        print(markdown)
+    print(f"{report.verdict} {report.sha256}", file=sys.stderr)
+    return GATE_PASS if report.passed else GATE_FAIL
+
+
 def _policy_hash(path: Path) -> int:
     try:
         policy = load_policy(path)
@@ -234,6 +293,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "provider-check": _provider_check,
         "ingest": lambda: _ingest(args),
         "data-report": lambda: _report(args),
+        "data-gate": lambda: _data_gate(args),
         "db-security-report": lambda: _report(args),
     }
     handler = handlers.get(args.command or "")
