@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import time
+import tracemalloc
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -19,6 +20,7 @@ from hypothesis import strategies as st
 
 from sentinel.domain import calendar
 from sentinel.domain.canonical import canonical_json
+from sentinel.domain.dataset import DatasetSpec, digest_candles, judge_dataset
 from sentinel.domain.market_data import OHLC, Candle, Timeframe
 from sentinel.domain.quality import (
     FAIL,
@@ -431,3 +433,41 @@ def test_quality_engine_throughput(capsys: pytest.CaptureFixture[str]) -> None:
             f"({n / elapsed:,.0f} candles/s)\n"
         )
     assert elapsed < 120
+
+
+YEAR_M1 = 372_000
+"""About one year of M1 bars (52 weeks x 5 days x 1,430 trading minutes)."""
+
+
+def test_gate_overhead_memory_and_yearly_projection(capsys: pytest.CaptureFixture[str]) -> None:
+    """Diagnostic: the gates' cost on top of the digest, and the engine's peak memory."""
+    n = 100_000
+    end = MON + timedelta(minutes=n)
+    spec = DatasetSpec("EUR_USD", Timeframe.M1, "oanda-practice", MON, end)
+    bars = _bars(n)
+    cfg = lenient_config()  # synthetic bars run through weekends; keep every row judged
+
+    t0 = time.perf_counter()
+    digest_candles(spec, bars)
+    digest_s = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    report = judge_dataset(spec, cfg, AS_OF, bars)
+    judged_s = time.perf_counter() - t0
+
+    tracemalloc.start()  # a separate run: tracing slows allocation, so it is not timed
+    judge_dataset(spec, cfg, AS_OF, bars)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert report.digest.rows == n
+    with capsys.disabled():
+        import sys
+
+        sys.stdout.write(
+            f"\n[bench] digest only: {n / digest_s:,.0f} candles/s; digest + quality gates: "
+            f"{n / judged_s:,.0f} candles/s (gates add {100 * (judged_s / digest_s - 1):+.0f}%); "
+            f"engine peak memory {peak / 1024:,.0f} KiB (input excluded); one year of M1 "
+            f"(~{YEAR_M1:,} bars) judged in ~{YEAR_M1 * judged_s / n:.1f}s\n"
+        )
+    assert peak < 16 * 1024 * 1024  # constant memory: bounded examples, no row buffering

@@ -523,9 +523,15 @@ def test_freeze_load_and_seal_overhead(db: Db, capsys: pytest.CaptureFixture[str
     loaded = _store(db, "svc_learning").load(record.snapshot_id)
     load_s = time.perf_counter() - started
     assert len(loaded) == n
+    started = time.perf_counter()
+    report = _store(db, "svc_learning").judge(_spec(0, n), PASS)
+    judge_s = time.perf_counter() - started
+    assert report.passed
+    assert report.digest.sha256 == record.sha256
     _report(
-        f"freeze {n:,} rows: {freeze_s:.2f}s ({n / freeze_s:,.0f} rows/s); verified load: "
-        f"{load_s:.2f}s ({n / load_s:,.0f} rows/s)",
+        f"freeze {n:,} rows (quality-gated): {freeze_s:.2f}s ({n / freeze_s:,.0f} rows/s); "
+        f"verified load (quality re-run): {load_s:.2f}s ({n / load_s:,.0f} rows/s); "
+        f"read-only gate report: {judge_s:.2f}s ({n / judge_s:,.0f} rows/s)",
         capsys,
     )
 
