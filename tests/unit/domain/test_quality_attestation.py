@@ -129,3 +129,39 @@ def test_judging_does_not_change_the_rows() -> None:
     rows = list(BARS)
     judge_dataset(SPEC, CFG, AS_OF, rows)
     assert rows == BARS
+
+
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
+def test_v3_a_report_cannot_be_given_another_configuration() -> None:
+    """``replace`` copies the issuer key, so the key alone proved nothing: a provisional
+    report re-labelled with an APPROVED configuration used to attest."""
+    provisional = quality_config(status=PROVISIONAL)
+    report = judge_dataset(SPEC, provisional, AS_OF, BARS)
+    with pytest.raises(DatasetError, match="do not match its canonical JSON"):
+        replace(report, config=CFG)
+    approved_body = judge_dataset(SPEC, CFG, AS_OF, BARS)
+    with pytest.raises(DatasetError, match="do not match its canonical JSON"):
+        replace(report, config=CFG, sha256=approved_body.sha256)
+
+
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
+def test_no_report_field_can_be_replaced_without_breaking_its_integrity() -> None:
+    report = judge_dataset(SPEC, CFG, AS_OF, BARS)
+    failing = judge_dataset(SPEC, CFG, AS_OF, BARS[:5] + BARS[25:])
+    other_spec = replace(SPEC, source="dukascopy")
+    changes: list[tuple[dict[str, object], str]] = [
+        ({"sha256": "0" * 64}, "hash does not match"),
+        ({"canonical_json": failing.canonical_json}, "do not match"),
+        ({"canonical_json": report.canonical_json + " "}, "do not match"),
+        ({"result": failing.result}, "do not match"),
+        ({"digest": failing.digest}, "do not match"),
+        ({"spec": other_spec}, "do not match"),
+        ({"as_of": AS_OF + timedelta(seconds=1)}, "do not match"),
+        ({"config": quality_config(max_gap_bars=16)}, "do not match"),
+        ({"config": None}, "wrong types"),
+        ({"as_of": "2020-01-01T00:00:00Z"}, "wrong types"),
+    ]
+    for change, match in changes:
+        with pytest.raises(DatasetError, match=match):
+            replace(report, **change)  # type: ignore[arg-type]
+    assert replace(report).sha256 == report.sha256  # an unchanged copy is still consistent

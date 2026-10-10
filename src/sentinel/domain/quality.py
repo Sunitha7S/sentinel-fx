@@ -161,6 +161,21 @@ def _text(where: str, value: object) -> str:
     return value
 
 
+def _held_decimal(where: str, value: object, *, positive: bool = True) -> Decimal:
+    """A threshold already held by an object: exactly a finite ``Decimal``, nothing coerced."""
+    if type(value) is not Decimal or not value.is_finite():
+        raise QualityConfigError(f"{where} must be a finite Decimal")
+    if positive and value <= 0:
+        raise QualityConfigError(f"{where} must be positive, got {value}")
+    return value
+
+
+def _completeness(where: str, value: Decimal) -> Decimal:
+    if not Decimal(0) < value <= Decimal(100):
+        raise QualityConfigError(f"{where}: completeness must be in (0, 100], got {value}")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class TimeframeThresholds:
     min_completeness_pct: Decimal
@@ -169,15 +184,25 @@ class TimeframeThresholds:
     jump_flag_pct: Decimal
     range_flag_pct: Decimal
 
+    def __post_init__(self) -> None:
+        """The same checks as ``parse``, so a directly built object cannot skip them."""
+        where = "TimeframeThresholds"
+        _completeness(
+            f"{where}.min_completeness_pct",
+            _held_decimal(f"{where}.min_completeness_pct", self.min_completeness_pct),
+        )
+        _count(f"{where}.max_gap_bars", self.max_gap_bars)
+        _count(f"{where}.max_unexpected_bars", self.max_unexpected_bars)
+        _held_decimal(f"{where}.jump_flag_pct", self.jump_flag_pct)
+        _held_decimal(f"{where}.range_flag_pct", self.range_flag_pct)
+
     @classmethod
     def parse(cls, where: str, raw: object) -> TimeframeThresholds:
         m = _fields(where, raw, _TIMEFRAME_KEYS)
-        completeness = _decimal(f"{where}.min_completeness_pct", m["min_completeness_pct"])
-        if not Decimal(0) < completeness <= Decimal(100):
-            raise QualityConfigError(
-                f"{where}.min_completeness_pct: completeness must be in (0, 100], "
-                f"got {completeness}"
-            )
+        completeness = _completeness(
+            f"{where}.min_completeness_pct",
+            _decimal(f"{where}.min_completeness_pct", m["min_completeness_pct"]),
+        )
         return cls(
             min_completeness_pct=completeness,
             max_gap_bars=_count(f"{where}.max_gap_bars", m["max_gap_bars"]),
@@ -190,6 +215,9 @@ class TimeframeThresholds:
 @dataclass(frozen=True, slots=True)
 class SymbolThresholds:
     max_spread: Decimal
+
+    def __post_init__(self) -> None:
+        _held_decimal("SymbolThresholds.max_spread", self.max_spread)
 
     @classmethod
     def parse(cls, where: str, raw: object) -> SymbolThresholds:
@@ -207,26 +235,49 @@ class QualityConfig:
     timeframes: Mapping[Timeframe, TimeframeThresholds]
     symbols: Mapping[str, SymbolThresholds]
     sha256: str
+    """Identity: SHA-256 of the canonical content. Checked against the content on every
+    construction (``from_mapping``, direct, ``dataclasses.replace``), so no object can carry
+    a hash that does not match what it holds. A matching hash proves integrity, not trust:
+    only the trusted registry decides which configurations may freeze or load."""
+
+    def __post_init__(self) -> None:
+        _check_header(self.version, self.status, self.engine, self.calendar)
+        _count("report.max_listed", self.max_listed, minimum=1, maximum=_MAX_LISTED)
+        # Checked as plain objects: a direct construction is not bound by the annotations.
+        timeframes: object = self.timeframes
+        if not isinstance(timeframes, Mapping) or not timeframes:
+            raise QualityConfigError("timeframes must list at least one timeframe")
+        for tf, tf_thresholds in timeframes.items():
+            if not isinstance(tf, Timeframe):
+                raise QualityConfigError(f"unknown timeframe {tf!r}")
+            _check_fixed_grid(tf)
+            if type(tf_thresholds) is not TimeframeThresholds:
+                raise QualityConfigError(f"timeframes.{tf} must be TimeframeThresholds")
+        symbols: object = self.symbols
+        if not isinstance(symbols, Mapping) or not symbols:
+            raise QualityConfigError("symbols must list at least one symbol")
+        for s, sym_thresholds in symbols.items():
+            _check_symbol(s)
+            if type(sym_thresholds) is not SymbolThresholds:
+                raise QualityConfigError(f"symbols.{s} must be SymbolThresholds")
+        # Private read-only copies: nothing held by the caller can change them afterwards.
+        object.__setattr__(self, "timeframes", MappingProxyType(dict(timeframes)))
+        object.__setattr__(self, "symbols", MappingProxyType(dict(symbols)))
+        sha256: object = self.sha256
+        if not isinstance(sha256, str) or sha256 != _identity_sha256(self):
+            raise QualityConfigError(
+                f"{self.version}: configuration identity mismatch (the hash does not match "
+                "the content)"
+            )
 
     @classmethod
     def from_mapping(cls, raw: object) -> QualityConfig:
         m = _fields("quality config", raw, _CONFIG_KEYS)
         version = _text("version", m["version"])
-        if not _VERSION.match(version):
-            raise QualityConfigError(f"version must look like qc_v1, got {version!r}")
         status = _text("status", m["status"])
-        if status not in (PROVISIONAL, APPROVED):
-            raise QualityConfigError(f"status must be {PROVISIONAL} or {APPROVED}, got {status!r}")
         engine = _text("engine", m["engine"])
-        if engine != QUALITY_ENGINE:
-            raise QualityConfigError(
-                f"engine {engine!r} is not implemented (only {QUALITY_ENGINE})"
-            )
         calendar = _text("calendar", m["calendar"])
-        if calendar != QUALITY_CALENDAR:
-            raise QualityConfigError(
-                f"calendar {calendar!r} is not implemented (only {QUALITY_CALENDAR})"
-            )
+        _check_header(version, status, engine, calendar)
         report = _fields("report", m["report"], ("max_listed",))
         max_listed = _count(
             "report.max_listed", report["max_listed"], minimum=1, maximum=_MAX_LISTED
@@ -241,11 +292,7 @@ class QualityConfig:
                 tf = Timeframe(key)
             except ValueError:
                 raise QualityConfigError(f"unknown timeframe {key!r}") from None
-            if not tf.fixed_utc_grid:
-                raise QualityConfigError(
-                    f"timeframe {tf}: engine {QUALITY_ENGINE} judges only fixed-grid timeframes "
-                    "(M1, M5, H1)"
-                )
+            _check_fixed_grid(tf)
             timeframes[tf] = TimeframeThresholds.parse(f"timeframes.{tf}", value)
 
         raw_symbols = m["symbols"]
@@ -253,22 +300,9 @@ class QualityConfig:
             raise QualityConfigError("symbols must list at least one symbol")
         symbols: dict[str, SymbolThresholds] = {}
         for key, value in raw_symbols.items():
-            if not isinstance(key, str) or not _SYMBOL.match(key):
-                raise QualityConfigError(f"symbol must look like EUR_USD, got {key!r}")
+            _check_symbol(key)
             symbols[key] = SymbolThresholds.parse(f"symbols.{key}", value)
 
-        identity = {
-            "version": version,
-            "status": status,
-            "engine": engine,
-            "calendar": calendar,
-            "report": {"max_listed": max_listed},
-            "timeframes": {
-                tf.value: {k: getattr(t, k) for k in _TIMEFRAME_KEYS}
-                for tf, t in timeframes.items()
-            },
-            "symbols": {s: {"max_spread": t.max_spread} for s, t in symbols.items()},
-        }
         return cls(
             version=version,
             status=status,
@@ -277,8 +311,87 @@ class QualityConfig:
             max_listed=max_listed,
             timeframes=MappingProxyType(timeframes),
             symbols=MappingProxyType(symbols),
-            sha256=sha256_hex(identity),
+            sha256=sha256_hex(
+                _identity(
+                    version=version,
+                    status=status,
+                    engine=engine,
+                    calendar=calendar,
+                    max_listed=max_listed,
+                    timeframes=timeframes,
+                    symbols=symbols,
+                )
+            ),
         )
+
+
+def _check_header(version: object, status: object, engine: object, calendar: object) -> None:
+    version = _text("version", version)
+    if not _VERSION.match(version):
+        raise QualityConfigError(f"version must look like qc_v1, got {version!r}")
+    status = _text("status", status)
+    if status not in (PROVISIONAL, APPROVED):
+        raise QualityConfigError(f"status must be {PROVISIONAL} or {APPROVED}, got {status!r}")
+    engine = _text("engine", engine)
+    if engine != QUALITY_ENGINE:
+        raise QualityConfigError(f"engine {engine!r} is not implemented (only {QUALITY_ENGINE})")
+    calendar = _text("calendar", calendar)
+    if calendar != QUALITY_CALENDAR:
+        raise QualityConfigError(
+            f"calendar {calendar!r} is not implemented (only {QUALITY_CALENDAR})"
+        )
+
+
+def _check_fixed_grid(tf: Timeframe) -> None:
+    if not tf.fixed_utc_grid:
+        raise QualityConfigError(
+            f"timeframe {tf}: engine {QUALITY_ENGINE} judges only fixed-grid timeframes "
+            "(M1, M5, H1)"
+        )
+
+
+def _check_symbol(key: object) -> None:
+    if not isinstance(key, str) or not _SYMBOL.match(key):
+        raise QualityConfigError(f"symbol must look like EUR_USD, got {key!r}")
+
+
+def _identity(
+    *,
+    version: str,
+    status: str,
+    engine: str,
+    calendar: str,
+    max_listed: int,
+    timeframes: Mapping[Timeframe, TimeframeThresholds],
+    symbols: Mapping[str, SymbolThresholds],
+) -> dict[str, JsonValue]:
+    """The hashed content. Changing this changes every configuration's identity."""
+    return {
+        "version": version,
+        "status": status,
+        "engine": engine,
+        "calendar": calendar,
+        "report": {"max_listed": max_listed},
+        "timeframes": {
+            tf.value: {k: canonical(getattr(t, k)) for k in _TIMEFRAME_KEYS}
+            for tf, t in timeframes.items()
+        },
+        "symbols": {s: {"max_spread": canonical(t.max_spread)} for s, t in symbols.items()},
+    }
+
+
+def _identity_sha256(c: QualityConfig) -> str:
+    return sha256_hex(
+        _identity(
+            version=c.version,
+            status=c.status,
+            engine=c.engine,
+            calendar=c.calendar,
+            max_listed=c.max_listed,
+            timeframes=c.timeframes,
+            symbols=c.symbols,
+        )
+    )
 
 
 # ============================================================================= engine v1

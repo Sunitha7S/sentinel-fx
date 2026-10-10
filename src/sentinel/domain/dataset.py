@@ -14,10 +14,13 @@ hash on every machine, OS, Python version and database:
 
 Quality (engine v1, ``sentinel.domain.quality``): ``judge_dataset`` runs the quality gates
 and the digest over the *same* rows in one pass and issues a ``QualityReport`` bound to the
-dataset identity, the exact configuration and the evaluation time. Only ``attest`` turns a
-PASS report from an APPROVED configuration into a ``QualityAttestation``; neither can be
-constructed any other way. A stored record carries only the ``QualityProvenance`` (verdict,
-report hash, configuration hash), which verification later reproduces.
+dataset identity, the exact configuration and the evaluation time; a report whose fields,
+canonical JSON and hash disagree cannot exist (so ``dataclasses.replace`` cannot re-label
+one). Only ``attest`` turns a PASS report from an APPROVED configuration into a
+``QualityAttestation``; neither can be constructed any other way. Whether an APPROVED
+configuration is *trusted* (ADR 0015) is decided by the registry the snapshot store holds.
+A stored record carries only the ``QualityProvenance`` (verdict, report hash, configuration
+hash), which verification later reproduces.
 
 Research code never reads raw candles. It receives a ``VerifiedDataset``, which only
 ``issue_verified_dataset`` can create, and only after recomputing the digest of the rows it
@@ -37,7 +40,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Final
 
-from sentinel.domain.canonical import canonical, canonical_json
+from sentinel.domain.canonical import JsonValue, canonical, canonical_json
 from sentinel.domain.market_data import Candle, Timeframe
 from sentinel.domain.quality import APPROVED, QualityChecker, QualityConfig, QualityResult
 from sentinel.domain.types import DomainError, require_utc
@@ -229,8 +232,24 @@ class QualityReport:
     _key: object = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        """The issuer key alone survives ``dataclasses.replace``; the content checks do not.
+        Every field must agree with the canonical JSON, and the JSON with the hash."""
         if self._key is not _REPORT_KEY:
             raise DatasetError("a QualityReport can only be issued by judge_dataset")
+        typed = (
+            (self.spec, DatasetSpec),
+            (self.digest, DatasetDigest),
+            (self.config, QualityConfig),
+            (self.result, QualityResult),
+            (self.as_of, datetime),
+        )
+        if not all(isinstance(value, kind) for value, kind in typed):
+            raise DatasetError("a QualityReport's fields have the wrong types")
+        body = _report_body(self.spec, self.digest, self.config, self.as_of, self.result)
+        if canonical_json(body) != self.canonical_json:
+            raise DatasetError("quality report fields do not match its canonical JSON")
+        if hashlib.sha256(self.canonical_json.encode("ascii")).hexdigest() != self.sha256:
+            raise DatasetError("quality report hash does not match its canonical JSON")
 
     @property
     def verdict(self) -> str:
@@ -239,6 +258,35 @@ class QualityReport:
     @property
     def passed(self) -> bool:
         return self.result.passed
+
+
+def _report_body(
+    spec: DatasetSpec,
+    digest: DatasetDigest,
+    config: QualityConfig,
+    as_of: datetime,
+    result: QualityResult,
+) -> dict[str, JsonValue]:
+    """The canonical report layout of engine v1 (pinned by the golden reports)."""
+    return {
+        "format": QUALITY_REPORT_FORMAT,
+        "engine": config.engine,
+        "calendar": config.calendar,
+        "config": {"version": config.version, "status": config.status, "sha256": config.sha256},
+        "dataset": {
+            "format": DATASET_FORMAT,
+            "symbol": spec.symbol,
+            "timeframe": spec.timeframe.value,
+            "source": spec.source,
+            "from": format_ts(spec.start),
+            "to": format_ts(spec.end),
+            "rows": digest.rows,
+            "rows_sha256": digest.rows_sha256,
+            "sha256": digest.sha256,
+        },
+        "as_of": format_ts(as_of),
+        "result": result.canonical(),
+    }
 
 
 def judge_dataset(
@@ -264,26 +312,7 @@ def judge_dataset(
         digester.add(c)
     digest = digester.finish()
     result = checker.finish()
-    body = {
-        "format": QUALITY_REPORT_FORMAT,
-        "engine": config.engine,
-        "calendar": config.calendar,
-        "config": {"version": config.version, "status": config.status, "sha256": config.sha256},
-        "dataset": {
-            "format": DATASET_FORMAT,
-            "symbol": spec.symbol,
-            "timeframe": spec.timeframe.value,
-            "source": spec.source,
-            "from": format_ts(spec.start),
-            "to": format_ts(spec.end),
-            "rows": digest.rows,
-            "rows_sha256": digest.rows_sha256,
-            "sha256": digest.sha256,
-        },
-        "as_of": format_ts(as_of),
-        "result": result.canonical(),
-    }
-    text = canonical_json(body)
+    text = canonical_json(_report_body(spec, digest, config, as_of, result))
     return QualityReport(
         spec=spec,
         digest=digest,
@@ -398,7 +427,14 @@ def issue_verified_dataset(
 ) -> VerifiedDataset:
     """Recompute the digest and the quality report of ``candles``; issue a VerifiedDataset
     only if both match the record exactly. ``quality`` must be the configuration the record
-    names (by hash); any other is refused."""
+    names (by hash), and APPROVED; any other is refused. Whether it is *trusted* (a matching
+    approval record) is decided by the trusted registry, which the store consults first."""
+    given: object = quality  # checked at run time; callers are not bound by the annotation
+    if not isinstance(given, QualityConfig) or given.status != APPROVED:
+        raise DatasetError(
+            f"snapshot {record.snapshot_id}: only an {APPROVED} quality configuration can "
+            "verify a snapshot"
+        )
     if quality.sha256 != record.quality.config_sha256:
         raise DatasetError(
             f"snapshot {record.snapshot_id}: quality configuration mismatch (the snapshot was "
