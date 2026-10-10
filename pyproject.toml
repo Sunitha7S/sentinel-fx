@@ -194,6 +194,16 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
+name = "research code reaches historical data only as a VerifiedDataset (INV-DATA-VERIFIED-ONLY)"
+type = "forbidden"
+source_modules = [
+    "sentinel.backtest", "sentinel.indicators", "sentinel.strategy", "sentinel.learning",
+]
+forbidden_modules = [
+    "sentinel.store", "sentinel.perception.market_data", "sentinel.config", "sentinel.cli",
+]
+
+[[tool.importlinter.contracts]]
 name = "LLM layer cannot reach trading state, policy or execution"
 type = "forbidden"
 source_modules = ["sentinel.llm", "sentinel.perception.news"]

@@ -56,5 +56,27 @@ REQUIRED_INVARIANTS: dict[str, str] = {
         "Market-data providers can only issue GET requests for historical candles on the "
         "practice host; order, account and streaming endpoints are unreachable."
     ),
+    "INV-MD-SINGLE-SOURCE": (
+        "A market-data series has exactly one source: rows from any other source are refused "
+        "by the database for every role, and only an owner-controlled trigger registers series."
+    ),
+    "INV-DATA-SNAPSHOT": (
+        "Verified datasets are reproducible and tamper-evident: a snapshot's digest is a pure, "
+        "machine-independent function of its rows, and any change to rows or record is "
+        "refused on load."
+    ),
+    "INV-DATA-SEALED": (
+        "Frozen ranges cannot change: no candle or spread row can be inserted inside a "
+        "snapshot's range by any role, and updates, deletes and truncation are refused."
+    ),
+    "INV-DATA-VERIFIED-ONLY": (
+        "Research code (backtest, indicators, strategy, learning) cannot reach raw market "
+        "data; historical data reaches it only as a VerifiedDataset issued after verification."
+    ),
+    "INV-DATA-QUALITY-GATED": (
+        "No research dataset may become a usable frozen snapshot unless the exact frozen rows "
+        "deterministically PASS the exact hashed quality configuration, and that result is "
+        "reproducible during verified load."
+    ),
     "INV-EXEC-01": "Execution is disabled; live trading needs explicit, consistent enabling.",
 }

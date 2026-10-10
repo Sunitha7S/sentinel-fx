@@ -195,3 +195,42 @@ def test_ingest_failure_keeps_progress_and_is_recorded() -> None:
             end=MON,
             clock=CLOCK,
         )
+
+
+@pytest.mark.invariant("INV-MD-SINGLE-SOURCE")
+def test_ingest_refuses_a_series_registered_to_another_source_without_fetching() -> None:
+    sink = MemorySink()
+    sink.insert([candle("EUR_USD", MON)], "oanda-practice")
+    provider = ListProvider("dukascopy", [[candle("EUR_USD", t) for t in minutes(MON, 5)]])
+    run = ingest(
+        provider,
+        sink,
+        symbol="EUR_USD",
+        timeframe=Timeframe.M1,
+        start=MON,
+        end=MON + timedelta(hours=1),
+        clock=CLOCK,
+    )
+    assert run.status == "FAILED"
+    assert run.error is not None
+    assert "registered to source oanda-practice" in run.error
+    assert provider.calls == 0
+    assert len(sink.rows) == 1
+    assert sink.runs == [run]
+
+
+def test_ingest_into_an_unregistered_or_same_source_series_proceeds() -> None:
+    sink = MemorySink()
+    provider = ListProvider("fake", [[candle("EUR_USD", t) for t in minutes(MON, 3)]])
+    for _ in range(2):
+        run = ingest(
+            provider,
+            sink,
+            symbol="EUR_USD",
+            timeframe=Timeframe.M1,
+            start=MON,
+            end=MON + timedelta(hours=1),
+            clock=CLOCK,
+        )
+        assert run.status == "SUCCEEDED"
+    assert sink.registered_source("EUR_USD", Timeframe.M1) == "fake"

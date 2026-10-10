@@ -1,4 +1,5 @@
-"""Markdown reports generated from a live database: security posture and data quality."""
+"""Markdown reports: security posture and data quality from a live database, and the
+human-readable form of a strict quality-gate report (the canonical JSON is authoritative)."""
 
 from __future__ import annotations
 
@@ -6,12 +7,14 @@ from datetime import datetime
 
 from sqlalchemy import Engine, text
 
+from sentinel.domain.dataset import QualityReport
+from sentinel.domain.quality import APPROVED, FLAGS, INTEGRITY_GATES
 from sentinel.perception.market_data.quality import analyse_fixed_grid, analyse_weekly
 from sentinel.store.postgres.engine import OWNER_ROLE, SERVICE_ROLES
 from sentinel.store.postgres.market_data_store import PostgresMarketDataStore
 from sentinel.store.postgres.permissions import PRIVILEGES, TABLES, expected
 
-__all__ = ["data_quality_report", "security_report"]
+__all__ = ["data_quality_report", "quality_gate_markdown", "security_report"]
 
 _ABBR = {
     "SELECT": "S",
@@ -215,4 +218,57 @@ def data_quality_report(
         "listed above.",
         "",
     ]
+    return "\n".join(lines)
+
+
+def quality_gate_markdown(report: QualityReport) -> str:
+    """Render a quality-gate report. Presentation only: the verdict and every number come
+    from the report, whose canonical JSON (and its hash) is the authoritative form."""
+    spec, cfg, r = report.spec, report.config, report.result
+    m = r.metrics
+    lines = [
+        f"# Data-quality gate: {spec.symbol} {spec.timeframe} [{_fmt(spec.start)}, "
+        f"{_fmt(spec.end)})",
+        "",
+        f"**Verdict: {r.verdict}**",
+        "",
+    ]
+    if cfg.status != APPROVED:
+        lines += [
+            f"> Configuration {cfg.version} is **{cfg.status}**. This report is for review only;",
+            "> no snapshot can be frozen against an unapproved configuration.",
+            "",
+        ]
+    lines += [
+        "| | |",
+        "|---|---|",
+        f"| Source | {spec.source} |",
+        f"| Rows | {report.digest.rows:,} |",
+        f"| Dataset SHA-256 | `{report.digest.sha256}` |",
+        f"| Configuration | {cfg.version} ({cfg.status}) `{cfg.sha256}` |",
+        f"| Engine / calendar | {cfg.engine} / {cfg.calendar} |",
+        f"| Evaluated at (UTC) | {_fmt(report.as_of)} |",
+        f"| Report SHA-256 | `{report.sha256}` |",
+        "",
+        "## Failures",
+        "",
+    ]
+    if r.failures:
+        lines += ["| Gate | Observed | Limit |", "|---|---|---|"]
+        lines += [f"| {f.gate} | {f.observed} | {f.limit} |" for f in r.failures]
+    else:
+        lines.append("None.")
+    lines += ["", "## Metrics", "", "| Metric | Value |", "|---|---|"]
+    lines += [f"| {k} | {v} |" for k, v in m.items()]
+    lines += ["", "## Counts", "", "| Check | Kind | Count |", "|---|---|---|"]
+    lines += [f"| {g} | FAIL if > 0 | {r.counts[g]:,} |" for g in INTEGRITY_GATES]
+    lines += [f"| {g} | flag | {r.counts[g]:,} |" for g in FLAGS]
+    lines.append(f"| unexpected_bar | series gate | {r.counts['unexpected_bar']:,} |")
+    if r.largest_gaps:
+        lines += ["", "## Largest gaps", "", "| From (UTC) | Missing bars |", "|---|---|"]
+        lines += [f"| {_fmt(g.start)} | {g.missing_bars:,} |" for g in r.largest_gaps]
+    for category, examples in r.examples.items():
+        lines += ["", f"## Examples: {category}", "", "| Bar (UTC) | Detail |", "|---|---|"]
+        lines += [f"| {_fmt(e.ts)} | {e.detail} |" for e in examples]
+    lines.append("")
     return "\n".join(lines)

@@ -4,6 +4,8 @@
   its progress and a re-run continues from the last stored bar.
 * Inserts skip bars that already exist; stored history is never overwritten.
 * Every run, successful or not, is recorded in ``ingestion_runs``.
+* A series belongs to the source that first wrote it (ADR 0014). A run from another source
+  fails before anything is fetched; the database refuses such rows regardless.
 """
 
 from __future__ import annotations
@@ -41,6 +43,10 @@ class IngestionRun:
 
 
 class MarketDataSink(Protocol):
+    def registered_source(self, symbol: str, timeframe: Timeframe) -> str | None:
+        """The source the series is registered to, or ``None`` if it has no rows yet."""
+        ...
+
     def latest_ts(self, symbol: str, timeframe: Timeframe) -> datetime | None: ...
 
     def insert(self, candles: Sequence[Candle], source: str) -> int:
@@ -75,7 +81,13 @@ def ingest(
     first: datetime | None = None
     last: datetime | None = None
     error: str | None = None
+    registered = sink.registered_source(symbol, timeframe)
     try:
+        if registered is not None and registered != provider.name:
+            raise ProviderError(
+                f"{symbol} {timeframe.value} is registered to source {registered}; "
+                f"refusing to mix in {provider.name}"
+            )
         if fetch_from < end:
             for batch in provider.fetch_candles(symbol, timeframe, fetch_from, end):
                 received += len(batch.candles) + batch.rejected

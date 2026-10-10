@@ -18,6 +18,7 @@ from sentinel.domain.market_data import Candle, Timeframe
 __all__ = [
     "CandleBatch",
     "MarketDataProvider",
+    "ProviderAccessDenied",
     "ProviderError",
     "ProviderUnavailable",
     "ReadOnlyViolation",
@@ -30,6 +31,18 @@ class ProviderError(Exception):
 
 class ProviderUnavailable(ProviderError):
     """The provider cannot be used (authentication, region, not implemented). Not retried."""
+
+
+class ProviderAccessDenied(ProviderUnavailable):
+    """The provider refused the credentials or the account (HTTP 401/403). Not retried.
+
+    401 means the token is invalid or revoked; 403 means the token is valid but the account
+    may not use this API, which is how a regional restriction shows up.
+    """
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class ReadOnlyViolation(ProviderError):

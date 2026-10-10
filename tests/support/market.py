@@ -80,10 +80,12 @@ class ListProvider:
     name: str
     batches: Sequence[Sequence[Candle]]
     fail_after: int | None = None
+    calls: int = 0
 
     def fetch_candles(
         self, symbol: str, timeframe: Timeframe, start: datetime, end: datetime
     ) -> Iterator[CandleBatch]:
+        self.calls += 1
         for i, batch in enumerate(self.batches):
             if self.fail_after is not None and i >= self.fail_after:
                 raise ProviderError("connection reset")
@@ -92,14 +94,24 @@ class ListProvider:
 
 @dataclass
 class MemorySink:
+    """Mirrors the database: a series is registered to the first source that writes it."""
+
     rows: dict[tuple[str, str, datetime], Candle] = field(default_factory=dict)
     runs: list[IngestionRun] = field(default_factory=list)
+    sources: dict[tuple[str, str], str] = field(default_factory=dict)
+
+    def registered_source(self, symbol: str, timeframe: Timeframe) -> str | None:
+        return self.sources.get((symbol, timeframe.value))
 
     def latest_ts(self, symbol: str, timeframe: Timeframe) -> datetime | None:
         ts = [k[2] for k in self.rows if k[0] == symbol and k[1] == timeframe.value]
         return max(ts) if ts else None
 
     def insert(self, candles: Sequence[Candle], source: str) -> int:
+        for c in candles:
+            registered = self.sources.setdefault((c.symbol, c.timeframe.value), source)
+            if registered != source:
+                raise AssertionError(f"series registered to source {registered}")
         new = 0
         for c in candles:
             key = (c.symbol, c.timeframe.value, c.ts)

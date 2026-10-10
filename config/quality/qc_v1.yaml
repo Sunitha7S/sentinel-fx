@@ -1,0 +1,113 @@
+# Data-quality configuration qc_v1.
+#
+# PROVISIONAL / UNCALIBRATED
+#
+# These values are conservative proposals written before any real dataset was examined.
+# They are not trusted production values. Before a real dataset is frozen for research:
+# run `sentinel data-gate` on the real history, classify every FAIL and flag (bad data,
+# legitimate market event, calendar assumption, threshold-design mistake), propose changes
+# with justification, and have a human approve them. Approval sets `status: APPROVED`,
+# which changes this file's hash; snapshots can only be frozen against an APPROVED config.
+# Thresholds are never tuned to make data pass and never changed after seeing strategy or
+# backtest results.
+#
+# The gates detect problems. They never clean data: nothing is deleted, replaced,
+# interpolated, smoothed or re-timed. A real extreme move that the provider reported stays
+# in the dataset; at most it is flagged.
+#
+# Identity: the hash covers the parsed content (version, status, engine, calendar and every
+# threshold), not comments, key order, line endings or decimal scale. Print it with
+#   sentinel quality-hash config/quality/qc_v1.yaml
+#
+# ---------------------------------------------------------------------------------------
+# Threshold reference. "FAIL" thresholds make the verdict FAIL; "flag" thresholds only
+# report. Some integrity gates have no threshold because any violation is a FAIL: OHLC
+# inconsistency, non-positive price, crossed quote (ask below bid at open, close, high or
+# low), negative volume, timestamps not strictly increasing, off-grid timestamps, and bars
+# that had not closed at evaluation time (future bars).
+#
+# min_completeness_pct: FAIL when present / expected bars, in percent, is below this.
+#   unit: percent of the bars the calendar expects in [from, to); Decimal.
+#   detects: ingestion holes, truncated downloads, provider outages.
+#   false positives: providers emit no M1 bar for a minute without ticks (quiet Asian
+#     hours, the 17:00 New York rollover); thin holiday sessions (24 and 31 December).
+#   scope: per timeframe.
+#
+# max_gap_bars: FAIL when any run of consecutive missing expected bars is longer.
+#   unit: bars of the timeframe (M1: minutes, M5: 5-minute bars, H1: hours); integer.
+#   detects: a contiguous outage that a high overall completeness could hide.
+#   false positives: early closes and very thin trading on holiday eves; a provider
+#     maintenance window that genuinely had no prices.
+#   scope: per timeframe.
+#
+# max_unexpected_bars: FAIL when more bars than this exist where the calendar says the
+#   market is closed (Friday 17:00 to Sunday 17:00 New York, 25 December, 1 January).
+#   unit: bars; integer.
+#   detects: mislabelled timestamps (time-zone or DST errors), a wrong calendar assumption.
+#   false positives: providers quoting during the holiday closures assumed here; a DST
+#     edge treated differently by the provider. These are calendar questions, not bad data.
+#   scope: per timeframe.
+#
+# jump_flag_pct: flag (never FAIL) a bar whose mid open differs from the previous bar's
+#   mid close by more than this.
+#   unit: percent of the previous mid close; Decimal.
+#   detects: candidate price spikes and decimal-shift errors worth a human look.
+#   false positives: flash crashes, central-bank interventions, weekend gaps at the Sunday
+#     open, news releases. These are real and stay in the data.
+#   scope: per timeframe.
+#
+# range_flag_pct: flag (never FAIL) a bar whose mid high-low range exceeds this.
+#   unit: percent of the bar's mid low; Decimal.
+#   detects: candidate single-bar spikes.
+#   false positives: the same real events as jump_flag_pct.
+#   scope: per timeframe.
+#
+# max_spread: FAIL when ask minus bid at the bar's open or close exceeds this.
+#   unit: price units of the symbol (EUR_USD 0.0001 = 1 pip; USD_JPY 0.01 = 1 pip); Decimal.
+#   detects: corrupt quotes (bid and ask from different instruments or scales, decimal
+#     shifts). Set at 100 pips, far above any normal quote, so it targets corruption rather
+#     than stress.
+#   false positives: an extreme liquidity event with a genuinely enormous quoted spread.
+#   scope: per symbol.
+#
+# max_listed: how many examples of each finding the report lists (counts are always
+#   complete). Presentation only; it never changes the verdict.
+#   unit: examples per category; integer.
+#   detects: nothing; bounds report size and memory.
+#   false positives: none.
+#   scope: whole report.
+# ---------------------------------------------------------------------------------------
+
+version: qc_v1
+status: PROVISIONAL_UNCALIBRATED
+engine: sentinel-quality/v1
+calendar: fx-ny1700-xmas-newyear/v1
+
+report:
+  max_listed: 20
+
+timeframes:
+  M1:
+    min_completeness_pct: 99.0
+    max_gap_bars: 15
+    max_unexpected_bars: 0
+    jump_flag_pct: 0.30
+    range_flag_pct: 0.50
+  M5:
+    min_completeness_pct: 99.5
+    max_gap_bars: 3
+    max_unexpected_bars: 0
+    jump_flag_pct: 0.50
+    range_flag_pct: 0.75
+  H1:
+    min_completeness_pct: 99.9
+    max_gap_bars: 1
+    max_unexpected_bars: 0
+    jump_flag_pct: 1.00
+    range_flag_pct: 1.50
+
+symbols:
+  EUR_USD:
+    max_spread: 0.0100
+  USD_JPY:
+    max_spread: 1.000

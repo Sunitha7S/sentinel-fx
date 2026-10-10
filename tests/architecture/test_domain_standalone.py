@@ -16,6 +16,8 @@ CORE_MODULES = [
     "sentinel.domain.decision",
     "sentinel.domain.system",
     "sentinel.domain.market_data",
+    "sentinel.domain.calendar",
+    "sentinel.domain.quality",
     "sentinel.fxmath.sizing",
     "sentinel.fxmath.conversion",
     "sentinel.fxmath.pips",

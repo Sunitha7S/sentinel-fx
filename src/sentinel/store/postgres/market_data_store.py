@@ -75,6 +75,17 @@ class PostgresMarketDataStore:
 
     # ------------------------------------------------------------------ MarketDataSink
 
+    def registered_source(self, symbol: str, timeframe: Timeframe) -> str | None:
+        with self._engine.connect() as conn:
+            value = conn.execute(
+                text(
+                    "SELECT source FROM sentinel.market_series "
+                    "WHERE symbol = :s AND timeframe = :tf"
+                ),
+                {"s": symbol, "tf": timeframe.value},
+            ).scalar_one_or_none()
+        return None if value is None else str(value)
+
     def latest_ts(self, symbol: str, timeframe: Timeframe) -> datetime | None:
         with self._engine.connect() as conn:
             value = conn.execute(
