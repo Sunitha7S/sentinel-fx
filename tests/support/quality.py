@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import tempfile
+from collections.abc import Iterable, Mapping
+from datetime import date
 from decimal import Decimal
+from pathlib import Path
 
+import yaml
+
+from sentinel.config.quality_loader import (
+    APPROVALS_DIRNAME,
+    QualityConfigRegistry,
+    load_quality_registry,
+)
 from sentinel.domain.quality import APPROVED, QUALITY_CALENDAR, QUALITY_ENGINE, QualityConfig
 
 SPREAD_CAPS = {"EUR_USD": "0.0100", "USD_JPY": "1.000"}
@@ -56,3 +66,67 @@ def lenient_config(**overrides: object) -> QualityConfig:
     }
     params.update(overrides)
     return quality_config(**params)  # type: ignore[arg-type]
+
+
+# ----------------------------------------------------------------------------- trusted registries
+
+
+def config_yaml(config: QualityConfig) -> str:
+    """The YAML file for ``config``; it parses back to the same identity."""
+    data = {
+        "version": config.version,
+        "status": config.status,
+        "engine": config.engine,
+        "calendar": config.calendar,
+        "report": {"max_listed": config.max_listed},
+        "timeframes": {
+            tf.value: {
+                "min_completeness_pct": str(t.min_completeness_pct),
+                "max_gap_bars": t.max_gap_bars,
+                "max_unexpected_bars": t.max_unexpected_bars,
+                "jump_flag_pct": str(t.jump_flag_pct),
+                "range_flag_pct": str(t.range_flag_pct),
+            }
+            for tf, t in config.timeframes.items()
+        },
+        "symbols": {s: {"max_spread": str(t.max_spread)} for s, t in config.symbols.items()},
+    }
+    return yaml.safe_dump(data, sort_keys=False)
+
+
+def approval_yaml(config: QualityConfig, **overrides: object) -> str:
+    """An approval record for ``config``; ``overrides`` replace or (with ``None``) drop keys."""
+    record: dict[str, object] = {
+        "config_version": config.version,
+        "config_sha256": config.sha256,
+        "approved_by": "test-reviewer",
+        "approved_on": date(2026, 1, 1),
+        "evidence": "tests only; never shipped",
+    }
+    record.update(overrides)
+    return yaml.safe_dump({k: v for k, v in record.items() if v is not None}, sort_keys=False)
+
+
+def write_configs(
+    directory: Path,
+    *configs: QualityConfig,
+    approve: Iterable[QualityConfig] | None = None,
+) -> Path:
+    """Write ``configs`` and approval records for ``approve`` (default: every APPROVED one)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    for config in configs:
+        (directory / f"{config.version}.yaml").write_text(config_yaml(config), encoding="utf-8")
+    approved = [c for c in configs if c.status == APPROVED] if approve is None else list(approve)
+    if approved:
+        folder = directory / APPROVALS_DIRNAME
+        folder.mkdir(exist_ok=True)
+        for config in approved:
+            (folder / f"{config.version}.yaml").write_text(approval_yaml(config), encoding="utf-8")
+    return directory
+
+
+def trusted_registry(*configs: QualityConfig) -> QualityConfigRegistry:
+    """A registry loaded, the only way there is, from a temporary directory holding
+    ``configs`` and an approval record for each APPROVED one."""
+    with tempfile.TemporaryDirectory() as tmp:
+        return load_quality_registry(write_configs(Path(tmp), *configs))

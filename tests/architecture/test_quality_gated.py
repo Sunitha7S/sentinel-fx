@@ -5,6 +5,10 @@
 * ``freeze``, ``load`` and ``issue_verified_dataset`` take exactly the arguments they need:
   no flag can skip, force or override the quality gates, anywhere in the code that judges,
   attests, freezes or verifies.
+* Trust has one origin (ADR 0015): only the loader creates a ``QualityConfigRegistry`` or
+  holds its key, production code loads the registry only from the shipped directory (no
+  argument, so no caller can point it at approvals of its own), and the snapshot store
+  takes a registry, never a caller-supplied mapping of configurations.
 """
 
 from __future__ import annotations
@@ -22,11 +26,12 @@ from sentinel.store.postgres.dataset_store import PostgresDatasetStore
 SRC = Path(__file__).resolve().parents[2] / "src"
 DATASET = Path("sentinel/domain/dataset.py")
 STORE = Path("sentinel/store/postgres/dataset_store.py")
+LOADER = Path("sentinel/config/quality_loader.py")
 GATED = (
     DATASET,
     STORE,
     Path("sentinel/domain/quality.py"),
-    Path("sentinel/config/quality_loader.py"),
+    LOADER,
 )
 BYPASS = re.compile(r"(force|override|bypass|skip|unsafe|ignore|allow_fail|unchecked|lenient)")
 ATTEST_CALL = re.compile(r"\battest\(")
@@ -47,6 +52,23 @@ def _bypass_names(path: Path) -> list[str]:
         elif isinstance(node, ast.Name):
             names = [node.id]
         found += [f"{path.name}:{node.lineno} {n}" for n in names if BYPASS.search(n.lower())]  # type: ignore[attr-defined]
+    return found
+
+
+def _registry_misuse(path: Path, rel: Path) -> list[str]:
+    """Calls that could choose the approvals a registry trusts, or forge a registry."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name == "load_quality_registry" and (node.args or node.keywords):
+                found.append(f"{rel}:{node.lineno} load_quality_registry with a directory")
+            if name == "QualityConfigRegistry" and rel != LOADER:
+                found.append(f"{rel}:{node.lineno} builds a QualityConfigRegistry")
+        if isinstance(node, ast.Name) and node.id == "_REGISTRY_KEY" and rel != LOADER:
+            found.append(f"{rel}:{node.lineno} references the registry key")
     return found
 
 
@@ -92,6 +114,20 @@ def test_no_entry_point_accepts_anything_that_could_bypass_the_gates() -> None:
     assert [p for path in GATED for p in _bypass_names(SRC / path)] == []
 
 
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
+def test_trust_comes_only_from_the_registry_loaded_from_the_shipped_directory() -> None:
+    offenders = []
+    for path in sorted((SRC / "sentinel").rglob("*.py")):
+        offenders += _registry_misuse(path, path.relative_to(SRC))
+    assert offenders == []
+    assert list(inspect.signature(PostgresDatasetStore.__init__).parameters) == [
+        "self",
+        "engine",
+        "registry",
+        "max_rows",
+    ]
+
+
 def test_the_scanners_detect_violations(tmp_path: Path) -> None:
     bad = tmp_path / "bad.py"
     bad.write_text(
@@ -103,3 +139,13 @@ def test_the_scanners_detect_violations(tmp_path: Path) -> None:
     )
     assert len(_bypass_names(bad)) == 3
     assert len(ATTEST_CALL.findall(_code_without_docstrings(bad))) == 1
+    misuse = tmp_path / "misuse.py"
+    misuse.write_text(
+        "load_quality_registry(Path('elsewhere'))\n"
+        "loader.load_quality_registry(directory=d)\n"
+        "load_quality_registry()\n"
+        "QualityConfigRegistry({}, frozenset(), _key=_REGISTRY_KEY)\n",
+        encoding="utf-8",
+    )
+    assert len(_registry_misuse(misuse, Path("sentinel/other.py"))) == 4
+    assert len(_registry_misuse(misuse, LOADER)) == 2  # the loader may build its registry
