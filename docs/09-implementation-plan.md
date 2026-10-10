@@ -40,7 +40,7 @@ Each milestone lists the **scope**, the **deliverables**, and the **done-when** 
 - Alembic migrations for the [MVP] tables in docs/02, including roles/grants and append-only triggers.
 - Historical bid/ask candle loader (OANDA practice API, M1/H1/H4/D1, 2015→) into `candles`. Build a spread sampler.
 - **Done when:**
-  - a test proves `svc_learning` gets *permission denied* inserting into `risk_rule_sets`;
+  - a test proves `svc_learning` gets *permission denied* writing `policy_versions`/`policy_activations`;
   - a test proves `UPDATE decisions` raises;
   - candles have been loaded for EURUSD and USDJPY with a gap report.
 

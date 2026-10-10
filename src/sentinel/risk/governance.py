@@ -44,6 +44,7 @@ __all__ = [
     "field_direction",
     "file_change_request",
     "issue_human_risk_admin",
+    "require_human_risk_admin",
 ]
 
 COOLING_OFF: Final = timedelta(hours=24)
@@ -195,7 +196,8 @@ def issue_human_risk_admin(identity: str, *, step_up_verified: bool) -> HumanRis
     return HumanRiskAdmin(identity, _CAPABILITY_KEY)
 
 
-def _require_admin(approver: object) -> HumanRiskAdmin:
+def require_human_risk_admin(approver: object) -> HumanRiskAdmin:
+    """Return ``approver`` if it is a genuine capability; raise ``GovernanceError`` otherwise."""
     if not isinstance(approver, HumanRiskAdmin) or approver._key is not _CAPABILITY_KEY:
         raise GovernanceError("a human risk-admin capability is required")
     return approver
@@ -261,7 +263,7 @@ def approve_change(
     trading_state: TradingState,
     drawdown: Percent,
 ) -> Activation:
-    admin = _require_admin(approver)
+    admin = require_human_risk_admin(approver)
     approved_at = require_utc(approved_at, field="approved_at")
     loosens = request.direction is not ChangeDirection.TIGHTEN
     if loosens and trading_state is TradingState.HALTED:
@@ -292,7 +294,7 @@ class ProtectedPolicyStore:
     """In-memory reference implementation of the protected policy store."""
 
     def __init__(self, initial: RiskPolicy, *, installed_by: HumanRiskAdmin, at: datetime) -> None:
-        _require_admin(installed_by)
+        require_human_risk_admin(installed_by)
         self.__active = initial
         self.__history: list[tuple[datetime, str, RiskPolicy]] = [
             (require_utc(at, field="at"), installed_by.identity, initial)
@@ -314,7 +316,7 @@ class ProtectedPolicyStore:
     def activate(
         self, activation: Activation, *, approver: HumanRiskAdmin, now: datetime
     ) -> RiskPolicy:
-        admin = _require_admin(approver)
+        admin = require_human_risk_admin(approver)
         now = require_utc(now, field="now")
         if activation.request.based_on_sha256 != self.active_sha256():
             raise GovernanceError("request was based on a policy that is no longer active")

@@ -1,14 +1,67 @@
 # 02 — Database Schema
 
-PostgreSQL 16 with the TimescaleDB, pgvector and pgcrypto extensions. Migrations are managed by Alembic. The DDL below is the target schema; the MVP subset is marked **[MVP]**.
+PostgreSQL 16 (plain; TimescaleDB deferred by [ADR 0010](adr/0010-plain-postgresql-defer-timescaledb.md)).
+Migrations are managed by Alembic in [`migrations/`](../migrations), and **the migrations are
+the source of truth** for implemented tables. This document summarises them and keeps the
+design DDL for tables planned in later milestones.
+
+| Status | Tables |
+|---|---|
+| **Implemented (M2)** | `policy_versions`, `policy_activations`, `decisions`, `approvals`, `shadow_trades`, `audit_records`, `audit_head`, `market_candles`, `spreads`, `ingestion_runs` |
+| Planned | everything in §1–§8 below, each marked with its milestone |
 
 ## Design principles
-- **Append-only for anything auditable.** Decisions, rule results, orders, fills and ruleset versions are never `UPDATE`d. State changes are new rows. Triggers reject `UPDATE`/`DELETE` on audit tables.
-- **Every decision references the exact snapshot IDs it read**, which is how replay is possible.
-- **Hash-chained decision log**: `decisions.hash = sha256(prev_hash || canonical_json(row))`. Tampering or silent edits are detectable.
-- **Money as `NUMERIC`**, prices as `NUMERIC(18,8)`. Never floats in persisted financial values.
-- **All timestamps `TIMESTAMPTZ` in UTC.**
-- **Role separation enforced by grants** (§9). The learning and LLM roles physically cannot write risk rules.
+- **Append-only for anything auditable.** Triggers refuse UPDATE, DELETE and TRUNCATE on every
+  append-only table, even for the owner. State changes are new rows.
+- **Hash-chained audit log in its own table** (`audit_records`, ADR 0009). The chain head is
+  anchored in `audit_head`, which only a trigger can advance. Decisions are not chained
+  themselves; each decision is recorded in the audit chain.
+- **Every decision references the exact policy hash** it was made under (foreign key), and an
+  APPROVED decision must reference the policy active when it is recorded.
+- **Money and prices as `NUMERIC`.** Never floats in persisted financial values.
+- **All timestamps `TIMESTAMPTZ`;** every application session runs in UTC.
+- **Role separation enforced by grants and ownership** (ADR 0011). No service role owns a table;
+  the learning role cannot write policy in any way.
+
+## 0. Implemented schema (M2)
+
+```mermaid
+erDiagram
+  policy_versions ||--o{ policy_versions : "parent_sha256"
+  policy_versions ||--o{ policy_activations : "policy_sha256 / based_on_sha256"
+  policy_versions ||--o{ decisions : "policy_sha256"
+  decisions ||--o{ approvals : "decision_id"
+  decisions ||--o| shadow_trades : "decision_id"
+  audit_records }o--|| audit_head : "head = last record (trigger)"
+  market_candles ||--|| spreads : "(symbol, timeframe, ts)"
+  ingestion_runs }o..o{ market_candles : "describes a load of"
+```
+
+| Table | Key | Writer role | Enforced by the database |
+|---|---|---|---|
+| `policy_versions` | `sha256` (content hash) | `human_admin` | immutable; `policy_id` unique; content re-hashed by the application on every load |
+| `policy_activations` | `seq` | `human_admin` | linear history (each names the policy it replaces), first row `INITIAL`, recorded only once effective, non-tightening changes ≥ 24 h after approval |
+| `decisions` | `decision_id` | `svc_risk` | APPROVED needs units > 0, candidate, state version, snapshot digest, no blocking rules, and the *currently active* policy hash; BLOCKED has zero units; full payload kept |
+| `approvals` | `approval_id`, unique `(decision_id, authority)` | `svc_risk` | must belong to an APPROVED decision with identical bindings; `expires_at > issued_at` |
+| `shadow_trades` | `decision_id` | `svc_risk` | outcome must equal its decision's outcome |
+| `audit_records` | `seq`; unique `prev_hash`, `hash` | `svc_audit` | each insert must extend `audit_head` exactly; payload stored as the exact hashed canonical JSON text |
+| `audit_head` | singleton | trigger only (`SECURITY DEFINER`) | never deleted or truncated; no role may update it directly |
+| `market_candles` | `(symbol, timeframe, ts)` | `svc_market_data` | bid/ask OHLC consistent, prices positive, ask ≥ bid at open and close; BRIN index on `ts` |
+| `spreads` | `(symbol, timeframe, ts)` → `market_candles` | `svc_market_data` | non-negative per-bar spreads at open and close |
+| `ingestion_runs` | `run_id` | `svc_market_data` | status `SUCCEEDED`/`FAILED`; failure requires an error |
+
+Migrations:
+
+| Revision | Content |
+|---|---|
+| 0001 | roles (idempotent, cluster-wide), schema `sentinel` owned by `sentinel_owner`, default privileges, append-only guard function |
+| 0002 | `policy_versions`, `policy_activations`, activation trigger, grants |
+| 0003 | `decisions`, `approvals`, `shadow_trades`, binding triggers, grants |
+| 0004 | `audit_records`, `audit_head`, head-advancing trigger, grants |
+| 0005 | `market_candles`, `spreads`, `ingestion_runs`, grants |
+
+The sections below are the **planned** schema for later milestones. They are unchanged from
+the original design except where noted.
 
 ## 1. Reference data
 
@@ -40,29 +93,12 @@ CREATE TABLE trading_holidays (
 );
 ```
 
-## 2. Market data
+## 2. Market data (remaining tables planned: M3/M7)
+
+`market_candles` and `spreads` are implemented (see above). Planned:
 
 ```sql
--- [MVP]
-CREATE TABLE candles (
-  symbol    TEXT NOT NULL REFERENCES instruments,
-  timeframe TEXT NOT NULL,                     -- M1,M5,H1,H4,D1
-  ts        TIMESTAMPTZ NOT NULL,              -- bar open time
-  o_bid NUMERIC(18,8), h_bid NUMERIC(18,8), l_bid NUMERIC(18,8), c_bid NUMERIC(18,8),
-  o_ask NUMERIC(18,8), h_ask NUMERIC(18,8), l_ask NUMERIC(18,8), c_ask NUMERIC(18,8),
-  tick_volume INT,
-  complete  BOOLEAN NOT NULL,                  -- never compute signals on incomplete bars
-  source    TEXT NOT NULL,
-  PRIMARY KEY (symbol, timeframe, ts)
-);
-SELECT create_hypertable('candles','ts', chunk_time_interval => INTERVAL '30 days');
 
-CREATE TABLE spread_samples (                  -- 1/min summary, not raw ticks
-  symbol TEXT NOT NULL, ts TIMESTAMPTZ NOT NULL,
-  spread_min NUMERIC, spread_med NUMERIC, spread_max NUMERIC, ticks INT,
-  PRIMARY KEY (symbol, ts)
-);
-SELECT create_hypertable('spread_samples','ts');
 
 -- [MVP] Agent 1 output
 CREATE TABLE market_health_reports (
@@ -161,39 +197,13 @@ CREATE TABLE session_plans (                   -- Agent 4 output
 );
 ```
 
-## 4. Risk governance (immutable, human-controlled)
+## 4. Governance (planned additions)
+
+`policy_versions` and `policy_activations` are implemented (see above). Planned for M14: a `policy_change_requests` table so that approved-but-cooling-off loosening survives restarts (today an activation row is written only once it is effective). Planned with the state service (M8):
 
 ```sql
--- [MVP]
-CREATE TABLE risk_rule_sets (
-  id           TEXT PRIMARY KEY,               -- 'rs_v7'
-  content      JSONB NOT NULL,                 -- full ruleset (from YAML), canonicalised
-  sha256       TEXT NOT NULL UNIQUE,
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-  created_by   TEXT NOT NULL,                  -- human identity only
-  parent_id    TEXT REFERENCES risk_rule_sets
-);
 
-CREATE TABLE risk_rule_change_requests (
-  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  proposed_ruleset_id TEXT NOT NULL REFERENCES risk_rule_sets,
-  origin        TEXT NOT NULL,                 -- 'human' | 'learning_proposal:<uuid>'
-  diff          JSONB NOT NULL,
-  direction     TEXT NOT NULL CHECK (direction IN ('TIGHTEN','LOOSEN','MIXED')),
-  evidence      JSONB,
-  status        TEXT NOT NULL CHECK (status IN ('PENDING','APPROVED','REJECTED','ACTIVE','SUPERSEDED')),
-  approved_by   TEXT, approved_at TIMESTAMPTZ,
-  effective_at  TIMESTAMPTZ,                   -- LOOSEN ⇒ ≥ approved_at + 24h, and next trading-day boundary
-  CHECK (status <> 'APPROVED' OR approved_by IS NOT NULL)
-);
 
-CREATE TABLE active_ruleset (                  -- exactly one row
-  singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton),
-  ruleset_id TEXT NOT NULL REFERENCES risk_rule_sets,
-  sha256 TEXT NOT NULL,
-  activated_at TIMESTAMPTZ NOT NULL,
-  change_request_id UUID REFERENCES risk_rule_change_requests
-);
 
 -- [MVP]
 CREATE TABLE system_state_log (                -- append-only; current = latest row
@@ -207,7 +217,9 @@ CREATE TABLE system_state_log (                -- append-only; current = latest 
 );
 ```
 
-## 5. Decisions (the audit core)
+## 5. Decision runs (planned: M8)
+
+`decisions` and `approvals` are implemented (see above). Rule results are stored inside `decisions.payload`. Planned with the LangGraph decision graph:
 
 ```sql
 -- [MVP]
@@ -218,7 +230,7 @@ CREATE TABLE decision_runs (                   -- one LangGraph run per bar clos
   mode system_mode NOT NULL,
   state_version BIGINT NOT NULL,               -- monotonic portfolio/account version read
   input_snapshot_ids JSONB NOT NULL,           -- {market:[...], calendar:..., news:..., session:..., portfolio:...}
-  ruleset_id TEXT NOT NULL, ruleset_sha256 TEXT NOT NULL,
+  policy_sha256 CHAR(64) NOT NULL REFERENCES sentinel.policy_versions,
   code_version TEXT NOT NULL,                  -- git sha
   langgraph_thread_id TEXT NOT NULL,
   status TEXT NOT NULL,                        -- COMPLETED|FAILED_CLOSED
@@ -237,41 +249,8 @@ CREATE TABLE signal_candidates (
   features JSONB NOT NULL                      -- decision-time feature vector for learning
 );
 
-CREATE TABLE decisions (                       -- final verdict per candidate (or run-level block)
-  id UUID PRIMARY KEY,
-  run_id UUID NOT NULL REFERENCES decision_runs,
-  candidate_id UUID REFERENCES signal_candidates,
-  outcome decision_outcome NOT NULL,
-  stage_blocked TEXT,                          -- PRE_GATE|VALIDATION|RISK|PORTFOLIO|SYSTEM_ERROR
-  quality_score NUMERIC, calibrated_exp_r NUMERIC,
-  approved_units NUMERIC, risk_pct NUMERIC,
-  explanation_canonical TEXT NOT NULL,
-  explanation_prose TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  prev_hash TEXT NOT NULL, hash TEXT NOT NULL UNIQUE
-);
 
-CREATE TABLE rule_results (                    -- every rule, every decision — no short-circuit
-  decision_id UUID NOT NULL REFERENCES decisions,
-  stage TEXT NOT NULL,                         -- VALIDATION|RISK|PORTFOLIO|EXECUTION_RECHECK
-  rule_id TEXT NOT NULL,                       -- 'R-ACC-04'
-  passed BOOLEAN NOT NULL,
-  severity TEXT NOT NULL,                      -- HARD|SOFT
-  observed JSONB, threshold JSONB,
-  message TEXT NOT NULL,
-  PRIMARY KEY (decision_id, stage, rule_id)
-);
 
-CREATE TABLE approvals (                       -- the three keys Execution requires
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  decision_id UUID NOT NULL REFERENCES decisions,
-  authority TEXT NOT NULL CHECK (authority IN ('VALIDATION','RISK','PORTFOLIO')),
-  state_version BIGINT NOT NULL,
-  issued_at TIMESTAMPTZ NOT NULL,
-  expires_at TIMESTAMPTZ NOT NULL,
-  payload_sha256 TEXT NOT NULL,                -- hash of (candidate, size, ruleset_sha)
-  UNIQUE (decision_id, authority)
-);
 ```
 
 ## 6. Execution, positions and account
@@ -343,19 +322,11 @@ CREATE TABLE reconciliation_runs (
 );
 ```
 
-## 7. Learning
+## 7. Learning (planned: M9–M12)
+
+`shadow_trades` is implemented (see above). Simulated outcomes go into a separate append-only `shadow_trade_outcomes` table (M9), never into updates. Planned:
 
 ```sql
--- [MVP] — shadow trades are cheap and are the main data source for learning
-CREATE TABLE shadow_trades (
-  candidate_id UUID PRIMARY KEY REFERENCES signal_candidates,
-  decision_outcome decision_outcome NOT NULL,
-  blocking_rules TEXT[] NOT NULL,              -- empty if approved
-  simulated_entry_at TIMESTAMPTZ, simulated_exit_at TIMESTAMPTZ,
-  filled BOOLEAN, r_multiple NUMERIC, mae_r NUMERIC, mfe_r NUMERIC, exit_reason TEXT,
-  cost_model_version TEXT NOT NULL,
-  resolved_at TIMESTAMPTZ
-);
 
 CREATE TABLE trade_journal (                   -- one per live/paper trade, enriched post-close
   trade_id UUID PRIMARY KEY REFERENCES trades,
@@ -387,7 +358,7 @@ CREATE TABLE learning_proposals (
   evidence JSONB NOT NULL,                     -- n, effect, CI, q-value, replay backtest id
   status TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN','ACCEPTED','REJECTED','EXPIRED')),
   reviewed_by TEXT, reviewed_at TIMESTAMPTZ,
-  change_request_id UUID REFERENCES risk_rule_change_requests   -- only via human action
+  change_request_id UUID                -- policy_change_requests (M14); only via human action
 );
 
 CREATE TABLE backtest_runs (
@@ -418,34 +389,12 @@ CREATE TABLE incidents (
 );
 ```
 
-## 9. Roles and grants (immutability enforced in the database)
+## 9. Roles and grants
 
-```sql
-CREATE ROLE svc_perception;   -- market, calendar, news, session services
-CREATE ROLE svc_decision;     -- LangGraph worker
-CREATE ROLE svc_execution;    -- execution + reconciler
-CREATE ROLE svc_learning;     -- learning jobs, LLM narration
-CREATE ROLE svc_api;          -- FastAPI (read + narrow writes)
-CREATE ROLE human_risk_admin; -- used only by the re-authenticated approval endpoint
-
-REVOKE ALL ON risk_rule_sets, risk_rule_change_requests, active_ruleset FROM PUBLIC;
-GRANT SELECT ON risk_rule_sets, active_ruleset TO svc_decision, svc_execution, svc_learning, svc_api;
-GRANT INSERT ON risk_rule_change_requests TO svc_api;            -- humans file requests via API
-GRANT INSERT, SELECT ON risk_rule_sets TO human_risk_admin;
-GRANT UPDATE (status, approved_by, approved_at, effective_at) ON risk_rule_change_requests TO human_risk_admin;
-GRANT UPDATE ON active_ruleset TO human_risk_admin;
--- svc_learning: INSERT on learning_proposals only; no access path to rule tables beyond SELECT.
-
--- Append-only enforcement
-CREATE FUNCTION forbid_mutation() RETURNS trigger LANGUAGE plpgsql AS
-$$ BEGIN RAISE EXCEPTION 'append-only table %', TG_TABLE_NAME; END $$;
-CREATE TRIGGER decisions_immutable BEFORE UPDATE OR DELETE ON decisions
-  FOR EACH ROW EXECUTE FUNCTION forbid_mutation();
--- same for rule_results, approvals, risk_rule_sets, fills, system_state_log
-```
+Implemented in migration 0001 and documented in [ADR 0011](adr/0011-database-security-model.md). The intended matrix lives in `src/sentinel/store/postgres/permissions.py`, and the `database` CI job compares it with the live database for every role × table × privilege. The earlier role list (`svc_perception`, `svc_decision`, `svc_api`, `human_risk_admin`) is superseded.
 
 ## 10. Retention
 - Raw ticks are **not stored**; only per-minute spread summaries and M1 bars.
-- `candles`: compress chunks older than 7 days, keep indefinitely (the backtest corpus).
+- `market_candles`, `spreads`: kept indefinitely, uncompressed (ADR 0010; revisit with tick data).
 - Decisions, rule results, orders, fills and journal: retain indefinitely (audit).
 - `llm_calls`: 1 year.

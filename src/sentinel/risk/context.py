@@ -197,17 +197,32 @@ class Context:
             max_units=inst.max_units,
         )
 
-    @cached_property
-    def prospective_risk(self) -> Decimal:
-        """Risk the new trade adds, in account currency. When sizing failed, the full risk
-        budget is assumed, so loss and exposure checks stay conservative."""
-        if self.sizing.ok:
-            return self.sizing.risk_amount
-        return self.equity * self.effective_risk.fraction
+    # ------------------------------------------------------------------ limit-check size
+    #
+    # Limit rules (loss limits, exposure, total risk, gap stress, leverage) judge the trade at
+    # the LARGEST size the policy could ever allow it: the base risk per trade, before the
+    # drawdown throttle, the mode multiplier, costs and rounding. Anything that only shrinks
+    # the size can therefore never turn a block into an approval (INV-KERNEL-02, ADR 0013).
+    # The approved size is still the throttled, cost-adjusted, rounded ``sizing``.
 
     @cached_property
-    def new_units(self) -> Decimal:
-        return self.sizing.units if self.sizing.ok else Decimal(0)
+    def base_risk(self) -> Percent:
+        cap = Percent.from_fraction(CODE_MAX_RISK_FRACTION)
+        return min(self.policy.risk_per_trade, cap)
+
+    @cached_property
+    def limit_risk(self) -> Decimal:
+        """Upper bound of the risk this trade can add, in account currency."""
+        return self.equity * self.base_risk.fraction
+
+    @cached_property
+    def limit_units(self) -> Decimal:
+        """Upper bound of the size this trade can have (zero cost, no rounding)."""
+        c = self.candidate
+        distance = (c.entry - c.stop_loss) * c.side.sign
+        if distance <= 0:
+            return Decimal(0)
+        return self.limit_risk / (distance * self.fx.rate(self.instrument.quote, self.account_ccy))
 
     def hold_end(self) -> datetime:
         return self.as_of + min(self.candidate.expected_hold, self.policy.max_hold_horizon)

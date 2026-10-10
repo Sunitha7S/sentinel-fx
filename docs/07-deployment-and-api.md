@@ -127,7 +127,7 @@ VM €30–60/mo; licensed calendar/news APIs vary widely (check current pricing
 | POST 🔐 | `/system/resume` | `{reason}` | HALTED → NO_NEW_TRADES, or NO_NEW_TRADES → ACTIVE; requires step-up |
 | POST 🔐 | `/system/mode` | `{to, reason}` | Promotion gated by `/evaluation/promotion-check`; demotion always allowed |
 | POST | `/risk/change-requests` | `{base_ruleset_id, yaml, reason}` | Creates PENDING + triggers replay backtest |
-| POST 🔐 | `/risk/change-requests/{id}/approve` | `{reason}` | Uses the `human_risk_admin` DB role; applies cooling-off for LOOSEN |
+| POST 🔐 | `/risk/change-requests/{id}/approve` | `{reason}` | Uses the `human_admin` DB role; applies cooling-off for LOOSEN |
 | POST | `/risk/change-requests/{id}/reject` | `{reason}` | |
 | POST | `/learning/proposals/{id}/review` | `{decision: ACCEPT\|REJECT, reason}` | ACCEPT on `RISK_RULE` opens a change request; it does not apply anything |
 | POST | `/trades/{id}/journal` | `{notes, process_grade}` | operator annotations |

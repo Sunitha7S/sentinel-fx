@@ -238,7 +238,7 @@ flowchart LR
   D3[(decisions, rule_results, approvals)]
   D4[(execution_intents, orders, fills, trades)]
   D5[(shadow_trades, journal, lessons, proposals)]
-  D6[(risk_rule_sets, active_ruleset)]
+  D6[(policy_versions, policy_activations)]
   DG[Decision Graph 5→6→7→9→Agg]
   EX[10 Execution]
   L8[8 Learning]

@@ -11,6 +11,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from sentinel.domain.decision import Outcome
+from sentinel.domain.system import SystemMode
 from sentinel.domain.types import Currency, Side
 from sentinel.risk.kernel import ALL_RULE_IDS, evaluate
 
@@ -112,3 +113,29 @@ def test_worse_inputs_never_turn_blocked_into_approved(
     if worse_d.outcome is Outcome.APPROVED:
         assert base_d.outcome is Outcome.APPROVED
         assert worse_d.units <= base_d.units
+
+
+@pytest.mark.invariant("INV-KERNEL-02")
+@pytest.mark.parametrize(
+    "worse",
+    [
+        {"drawdown_pct": Decimal("4.0")},  # throttle 0.75x
+        {"drawdown_pct": Decimal("8.0")},  # throttle 0.25x
+        {"mode": SystemMode.LIVE_MICRO},  # mode multiplier 0.2x
+    ],
+)
+def test_size_reductions_never_unlock_a_trade_blocked_by_a_limit(worse: dict[str, object]) -> None:
+    """Regression for a counterexample found by Hypothesis: with equity 500 and a 2.52 %
+    weekly loss, a full-size trade breaches the 3 % weekly limit. The drawdown throttle used
+    to shrink the trade until it fit, so a *higher* drawdown approved it. Limit rules now judge
+    the trade at the policy's maximum size (ADR 0013)."""
+    base = Knobs(
+        equity=Decimal(500),
+        week_loss_pct=Decimal("2.52"),
+        drawdown_pct=Decimal("2.67"),
+        stop_pips=Decimal(20),
+        target_pips=Decimal(38),
+        spread_multiple=Decimal("0.5"),
+    )
+    assert "R-ACC-02" in evaluate(inputs(base)).blocking_rules
+    assert "R-ACC-02" in evaluate(inputs(replace(base, **worse))).blocking_rules  # type: ignore[arg-type]

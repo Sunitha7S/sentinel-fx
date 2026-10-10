@@ -18,14 +18,15 @@ sentinel-fx/
 │   ├── known_schedules/2026.yaml    # FOMC/ECB/BoE/BoJ/RBA/BoC dates, NFP
 │   ├── tripwires.yaml
 │   └── settings.example.toml        # no secrets
-├── migrations/                      # Alembic
+├── alembic.ini
+├── migrations/                      # Alembic: versions/0001-0005 (roles, policy, decisions, audit, market data)
 ├── src/sentinel/
-│   ├── domain/                      # Pydantic models: the contracts. No I/O.
+│   ├── domain/                      # stdlib dataclasses: the contracts. No I/O, no Pydantic (ADR 0002)
 │   │   ├── market.py  calendar.py  news.py  session.py  signals.py
 │   │   ├── risk.py  portfolio.py  execution.py  learning.py  system.py
 │   ├── fxmath/                      # pip values, conversion, sizing (Decimal). No I/O.
 │   ├── indicators/                  # ATR, EMA, ADX, swings, levels, regime — shared live/backtest
-│   ├── risk/                        # ★ risk kernel: pure, stdlib+pydantic only
+│   ├── risk/                        # ★ risk kernel: pure, stdlib + domain + fxmath only
 │   │   ├── kernel.py  rules/  ruleset.py  sizing.py  exposure.py  ruin.py  state_machine.py
 │   ├── perception/
 │   │   ├── market_data/             # broker streaming, bar builder, spread sampler
@@ -49,7 +50,10 @@ sentinel-fx/
 │   │   ├── loss_mining.py  calibration.py  proposals.py  lessons.py
 │   ├── backtest/                    # engine.py, cost_model.py, walkforward.py, dsr.py, reports.py
 │   ├── llm/                         # LLMClient interface, PydanticAI agents, prompts/ (versioned), budget.py
-│   ├── store/                       # SQLAlchemy models, repositories, outbox, roles
+│   ├── audit/                       # hash-chained audit records (pure)
+│   ├── schemas/                     # Pydantic boundary schemas (messages, LLM output)
+│   ├── config/                      # settings and policy-file loading
+│   ├── store/                       # JSONL sinks; postgres/ (engine, stores, permissions, reports)
 │   ├── bus/                         # Redis Streams / PG notify abstraction
 │   ├── observability/               # metrics.py, logging.py, tracing.py, heartbeat.py
 │   ├── api/                         # FastAPI app, routers/, auth.py, stepup.py
