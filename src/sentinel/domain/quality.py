@@ -240,7 +240,35 @@ class QualityConfig:
     a hash that does not match what it holds. A matching hash proves integrity, not trust:
     only the trusted registry decides which configurations may freeze or load."""
 
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        """A subclass could skip ``__post_init__`` and carry any hash; none may exist."""
+        raise TypeError("QualityConfig cannot be subclassed")
+
     def __post_init__(self) -> None:
+        timeframes, symbols = self._checked_fields()
+        # Private read-only copies: nothing held by the caller can change them afterwards.
+        object.__setattr__(self, "timeframes", MappingProxyType(dict(timeframes)))
+        object.__setattr__(self, "symbols", MappingProxyType(dict(symbols)))
+        self._check_identity()
+
+    def verify(self) -> QualityConfig:
+        """Re-check this object without changing it and return it.
+
+        ``__post_init__`` is the gate for normal construction, but an object allocated with
+        ``object.__new__`` never ran it. Consumers that issue or verify attestations call
+        this rather than trusting an object for its type alone."""
+        if type(self) is not QualityConfig:
+            raise QualityConfigError("not a QualityConfig")
+        try:
+            timeframes, symbols = self._checked_fields()
+        except AttributeError as exc:  # a field was never set
+            raise QualityConfigError(f"incomplete quality configuration: {exc}") from exc
+        if type(timeframes) is not MappingProxyType or type(symbols) is not MappingProxyType:
+            raise QualityConfigError(f"{self.version}: thresholds are not held read-only")
+        self._check_identity()
+        return self
+
+    def _checked_fields(self) -> tuple[Mapping[object, object], Mapping[object, object]]:
         _check_header(self.version, self.status, self.engine, self.calendar)
         _count("report.max_listed", self.max_listed, minimum=1, maximum=_MAX_LISTED)
         # Checked as plain objects: a direct construction is not bound by the annotations.
@@ -253,6 +281,7 @@ class QualityConfig:
             _check_fixed_grid(tf)
             if type(tf_thresholds) is not TimeframeThresholds:
                 raise QualityConfigError(f"timeframes.{tf} must be TimeframeThresholds")
+            tf_thresholds.__post_init__()  # validates only; covers objects built without it
         symbols: object = self.symbols
         if not isinstance(symbols, Mapping) or not symbols:
             raise QualityConfigError("symbols must list at least one symbol")
@@ -260,9 +289,10 @@ class QualityConfig:
             _check_symbol(s)
             if type(sym_thresholds) is not SymbolThresholds:
                 raise QualityConfigError(f"symbols.{s} must be SymbolThresholds")
-        # Private read-only copies: nothing held by the caller can change them afterwards.
-        object.__setattr__(self, "timeframes", MappingProxyType(dict(timeframes)))
-        object.__setattr__(self, "symbols", MappingProxyType(dict(symbols)))
+            sym_thresholds.__post_init__()
+        return timeframes, symbols
+
+    def _check_identity(self) -> None:
         sha256: object = self.sha256
         if not isinstance(sha256, str) or sha256 != _identity_sha256(self):
             raise QualityConfigError(

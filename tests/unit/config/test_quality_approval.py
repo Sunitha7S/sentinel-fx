@@ -30,7 +30,7 @@ from sentinel.config.quality_loader import (
     parse_approval_yaml,
     parse_quality_yaml,
 )
-from sentinel.domain.dataset import DatasetError, DatasetSpec, attest, judge_dataset
+from sentinel.domain.dataset import DatasetError, DatasetSpec, attest
 from sentinel.domain.market_data import Timeframe
 from sentinel.domain.quality import (
     APPROVED,
@@ -183,8 +183,7 @@ def test_an_approved_configuration_with_its_record_is_trusted(tmp_path: Path) ->
     assert trusted == cfg
     assert trusted is registry.approved(cfg.sha256)  # always the registry's own object
     assert trusted is not cfg
-    report = judge_dataset(SPEC, trusted, MON + timedelta(days=1), BARS)
-    assert attest(report).config_sha256 == cfg.sha256
+    assert attest(SPEC, trusted, MON + timedelta(days=1), BARS).config_sha256 == cfg.sha256
     with pytest.raises(QualityConfigError, match="PROVISIONAL_UNCALIBRATED"):
         registry.approved(provisional.sha256)
 
@@ -361,3 +360,52 @@ def test_freeze_refuses_untrusted_configurations_before_touching_the_database() 
             store.freeze(SPEC, quality)
     with pytest.raises(DatasetError, match="quality configuration is required"):
         store.freeze(SPEC, None)  # type: ignore[arg-type]
+
+
+# ----------------------------------------------------------------------------- F1: registry forgery
+
+
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
+def test_a_registry_cannot_be_subclassed_even_to_override_approved() -> None:
+    with pytest.raises(TypeError, match="cannot be subclassed"):
+
+        class Evil(QualityConfigRegistry):
+            __slots__ = ()
+
+            def __init__(self) -> None:  # skips the key check
+                pass
+
+            def approved(self, sha256: str) -> QualityConfig:
+                return _approved_twin(QC_V1)
+
+    with pytest.raises(TypeError, match="cannot be subclassed"):
+        type("Evil", (QualityConfigRegistry,), {})
+
+
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
+def test_a_registry_allocated_or_sealed_without_the_loader_authorises_nothing() -> None:
+    twin = _approved_twin(QC_V1)
+    hollow = QualityConfigRegistry.__new__(QualityConfigRegistry)
+    with pytest.raises(QualityConfigError, match="not issued by load_quality_registry"):
+        hollow.approved(twin.sha256)
+    forged = object.__new__(QualityConfigRegistry)
+    object.__setattr__(forged, "_configs", MappingProxyType({twin.sha256: twin}))
+    object.__setattr__(forged, "_approved", frozenset({twin.sha256}))
+    object.__setattr__(forged, "_sealed", object())  # anything but the loader's private key
+    with pytest.raises(QualityConfigError, match="not issued by load_quality_registry"):
+        forged.approved(twin.sha256)
+    for registry in (hollow, forged):
+        with pytest.raises(QualityConfigError, match="not issued by load_quality_registry"):
+            registry.verify()
+        with pytest.raises(DatasetError, match="not issued by load_quality_registry"):
+            _store(registry)  # refused by the store before freeze or load could run
+
+
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
+def test_only_the_loaders_registry_authorises_freeze() -> None:
+    cfg = quality_config()
+    registry = trusted_registry(cfg)
+    trusted = registry.approved(cfg.sha256)
+    store = _store(registry)
+    with pytest.raises(AssertionError, match="the database was touched"):
+        store.freeze(SPEC, trusted)  # every trust check passed; only now is the engine used

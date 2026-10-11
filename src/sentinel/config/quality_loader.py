@@ -219,11 +219,15 @@ class QualityConfigRegistry:
     """Every shipped configuration by content hash, and which of them are approved.
 
     Created only by ``load_quality_registry`` and read-only afterwards. It is not a
-    dataclass, so ``dataclasses.replace`` cannot copy it with different contents."""
+    dataclass (``dataclasses.replace`` does not apply), it cannot be subclassed (a subclass
+    could override ``approved``), and it carries a seal that only its key-checked
+    constructor sets, so an instance made with ``__new__`` authorises nothing. The snapshot
+    store additionally requires this exact type."""
 
-    __slots__ = ("_approved", "_configs")
+    __slots__ = ("_approved", "_configs", "_sealed")
     _configs: Mapping[str, QualityConfig]
     _approved: frozenset[str]
+    _sealed: object
 
     def __init__(
         self, configs: Mapping[str, QualityConfig], approved: frozenset[str], *, _key: object
@@ -234,6 +238,10 @@ class QualityConfigRegistry:
             )
         object.__setattr__(self, "_configs", MappingProxyType(dict(configs)))
         object.__setattr__(self, "_approved", frozenset(approved))
+        object.__setattr__(self, "_sealed", _REGISTRY_KEY)
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("QualityConfigRegistry cannot be subclassed")
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError("QualityConfigRegistry is read-only")
@@ -245,12 +253,25 @@ class QualityConfigRegistry:
     def configs(self) -> Mapping[str, QualityConfig]:
         return self._configs
 
+    def verify(self) -> QualityConfigRegistry:
+        """Refuse unless ``load_quality_registry`` issued this exact object; return it.
+
+        An instance allocated with ``__new__``, or sealed with anything but the loader's
+        private key, authorises nothing."""
+        if type(self) is not QualityConfigRegistry or (
+            getattr(self, "_sealed", None) is not _REGISTRY_KEY
+        ):
+            raise QualityConfigError(
+                "this registry was not issued by load_quality_registry; it authorises nothing"
+            )
+        return self
+
     def approved(self, sha256: str) -> QualityConfig:
         """The registry's own configuration with this hash, if it is approved; else refuse.
 
         This is the only way the snapshot store obtains a configuration to freeze or load
         with; an object built elsewhere is never returned, whatever its hash."""
-        config = self.resolve(sha256)
+        config = self.verify().resolve(sha256)
         if sha256 not in self._approved or config.status != APPROVED:
             raise QualityConfigError(
                 f"quality configuration {config.version} ({sha256}) is {config.status} and has "

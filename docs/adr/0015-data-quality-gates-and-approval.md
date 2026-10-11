@@ -3,8 +3,10 @@
 - **Status:** proposed (implementation and this record awaiting review)
 - **Date:** 2026-10-10
 
-Each section is marked **implemented** (true of the code at this commit, enforced by tests)
-or **proposed / open** (not decided until this ADR is accepted).
+Each section is marked **implemented** (true of the code at this commit, enforced by
+runtime checks and tests), **procedural** (relies on people and review, not code) or
+**proposed / open** (not decided until this ADR is accepted). Residual limits are stated
+where they apply.
 
 ## Context
 
@@ -33,6 +35,18 @@ callers could alter in memory, demonstrated three ways:
 
 `freeze` and `load` also trusted whatever configuration objects the caller supplied. No
 production code froze or loaded a snapshot, so none of this was reachable in production.
+
+A first fix (commit 31d0a86) closed those three. An independent review of it then found
+three gaps, closed by the hardening described in §3 and §4:
+
+- **F1:** a subclass of `QualityConfigRegistry` that overrode `__init__` and `approved()`
+  passed the store's `isinstance` check and got an unapproved configuration through
+  `freeze`'s trust checks.
+- **F2:** the architecture scan missed aliases of `load_quality_registry`, `getattr` and
+  attribute access to the registry key, `functools.partial`, and subclasses.
+- **F3:** a report relabelled with another configuration, with its canonical JSON and hash
+  recomputed, was internally consistent and `attest()` accepted it, although the same rows
+  FAILED under the configuration it named.
 
 ## Decision
 
@@ -76,13 +90,34 @@ this work; `qc_v1`'s hash and both golden report hashes are pinned by tests.
   also checks every field (version pattern, status, engine, calendar, `max_listed`,
   fixed-grid timeframes, symbol format, threshold types) and keeps private read-only copies
   of the threshold mappings.
+- **Consumers re-verify; a type is not trust.** `QualityConfig` cannot be subclassed
+  (`__init_subclass__` raises). `QualityConfig.verify()` re-runs every check, including each
+  threshold's own checks, without changing the object. `attest` and `issue_verified_dataset`
+  call it, so an object allocated with `object.__new__` (which never ran `__post_init__`),
+  with a forged hash or invalid thresholds, is refused.
 - **Thresholds validate themselves.** `TimeframeThresholds` and `SymbolThresholds` apply the
   same range checks in `__post_init__` as the YAML parser does, and accept only finite
   `Decimal` values and exact integers.
-- **Reports are internally consistent.** `QualityReport.__post_init__` rebuilds the
-  canonical JSON from the report's own fields (spec, digest, configuration, `as_of`,
-  result), requires it to equal `canonical_json`, and requires `sha256` to be its hash.
-  Replacing any one of them is refused, which closes V3.
+- **Reports are internally consistent, not authoritative.** `QualityReport.__post_init__`
+  rebuilds the canonical JSON from the report's own fields (spec, digest, configuration,
+  `as_of`, result), requires it to equal `canonical_json`, and requires `sha256` to be its
+  hash. Replacing any one field is refused. Replacing several consistently (F3) still yields
+  a well-formed report object; this check proves integrity, not that the rows were judged.
+  `QualityReport` cannot be subclassed.
+- **Attestation is inseparable from judging (F3).** `attest(spec, config, as_of, candles)`
+  takes rows, never a report. It re-verifies the configuration, refuses anything but
+  APPROVED, judges and digests the rows itself in one pass, and issues an attestation only
+  for a PASS. No report object, however built or relabelled, can become an attestation, and
+  this does not depend on which module calls `attest`. `QualityAttestation` is not a
+  dataclass (so `dataclasses.replace` does not apply), cannot be subclassed, is read-only
+  (copying fails), and its key-checked constructor takes only the report `attest` just
+  produced. `freeze` uses the attestation it obtained from that call, never one supplied by
+  a caller. Verified load re-judges the stored rows itself.
+
+  Alternatives considered: tracking issued report objects (rejected: global mutable state in
+  the pure domain, a weak-reference slot, and object identity becoming part of
+  correctness), and a keyed seal over reports (rejected: a secret held in the domain, the
+  same private-key tier as the issuer keys, more machinery).
 
 A matching hash proves integrity, not trust: a configuration built in memory with a
 correctly recomputed hash is honest about its content but is still never trusted (§4).
@@ -101,16 +136,43 @@ correctly recomputed hash is honest about its content but is still never trusted
 record or more than one; if a record names a hash that matches no configuration (unknown, or
 stale after an edit); if a record names a provisional configuration; if a record's version
 differs from its configuration's; or if any record is malformed. With no `approvals/`
-directory, nothing is approved. Only `load_quality_registry` can create a
-`QualityConfigRegistry` (an issuer key; not a dataclass, so `dataclasses.replace` does not
-apply; read-only after construction). `registry.approved(sha256)` returns the registry's own
+directory, nothing is approved. `registry.approved(sha256)` returns the registry's own
 object for an approved hash and refuses anything else.
 
-**Trusted origin (implemented).** The approvals directory is always the `approvals/`
-subdirectory of the configuration directory; it cannot be chosen separately. Production
-code calls `load_quality_registry()` only without arguments, which means the shipped
-`config/quality/`. An architecture test enforces this and also forbids building a
-registry or using its key outside the loader. Tests pass a temporary directory.
+**Registry integrity (implemented, F1).** Runtime checks are authoritative:
+
+- The constructor requires the loader's private key and sets a seal to that key.
+  `verify()` and `approved()` refuse unless the object is exactly `QualityConfigRegistry`
+  and carries that seal, so an instance allocated with `__new__`, or sealed with anything
+  else, authorises nothing.
+- The class cannot be subclassed (`__init_subclass__` raises, for `class` statements and
+  three-argument `type()` alike), so `approved()` cannot be overridden.
+- It is not a dataclass (`dataclasses.replace` does not apply) and is read-only after
+  construction (copying and pickling fail).
+- `PostgresDatasetStore` requires the exact type and calls `verify()` when it is
+  constructed, so a forged registry is refused before `freeze` or `load` can reach the
+  database.
+
+**Trusted origin (implemented; partly enforced by review).** The approvals directory is
+always the `approvals/` subdirectory of the configuration directory; it cannot be chosen
+separately. `load_quality_registry` still accepts a directory argument so tests can load
+temporary directories; nothing at run time stops a caller passing one. That production code
+calls it only without arguments, which means the shipped `config/quality/`, is enforced by
+the architecture scan (F2), not by the runtime.
+
+The scan (`tests/architecture/test_quality_gated.py`) flags, outside the module that owns
+them:
+
+- any use of `load_quality_registry` other than a direct call without arguments (aliases,
+  `functools.partial`, `getattr` by name, import under another name);
+- any mention of the private issuance mechanisms (`_REGISTRY_KEY`, the registry seal,
+  `_load_approvals`, `_match_approvals`, `_REPORT_KEY`, `_ATTESTATION_KEY`), including
+  attribute access and string names;
+- subclasses of the guarded classes, `__new__` allocation of them, three-argument `type()`,
+  and building a `QualityConfigRegistry`.
+
+Each evasion has a regression fixture. A static scan cannot prove the absence of a
+deliberate bypass (string building, `exec`); it is a second line of defence.
 
 **Store enforcement (implemented).** `PostgresDatasetStore` takes `registry=`; there is no
 longer a caller-supplied mapping of configurations.
@@ -118,7 +180,8 @@ longer a caller-supplied mapping of configurations.
 - `freeze` refuses without a registry. It also refuses any configuration that
   `registry.approved()` does not return, or that is not the very object the registry
   returned. All of this happens before the database is touched, so nothing is written and
-  no range is sealed. It then judges with the registry's object.
+  no range is sealed. It then calls `attest` with the registry's object, which judges the
+  rows under the transaction's lock.
 - `load` refuses without a registry and verifies only under `registry.approved()` for the
   snapshot's recorded configuration hash. `issue_verified_dataset` also requires an APPROVED
   configuration.
@@ -135,13 +198,24 @@ contributor, it is in practice self-review with an audit trail, not separation o
 
 - *Status field only:* approval would be an unattributed edit.
 - *Approval stored in the database under the `HumanRiskAdmin` capability:* needs a schema
-  migration and step-up authentication (planned for M14). It is a candidate successor.
+  migration and step-up re-authentication, neither of which exists yet. The implementation
+  plan lists "OIDC + WebAuthn step-up" under M14 (`docs/09-implementation-plan.md`), and
+  `docs/07-deployment-and-api.md` describes step-up for dangerous endpoints. It is a
+  candidate successor.
 - *Signed approvals:* key management is out of scope.
 
-**Residual risk (recorded).** Python cannot stop deliberate forgery: code that imports a
-private issuer key, or calls `object.__setattr__` on frozen objects, can still forge
-objects. As with `HumanRiskAdmin`, the protection is against accidental and convenient
-bypasses, backed by architecture tests and review.
+**Approval evidence is procedural and hash-bound (procedural).** A record binds a decision
+to one exact configuration hash. `approved_by`, `approved_on` and `evidence` are free text
+that the loader checks only for form: it verifies no identity, no signature and no
+existence of the evidence. Who approved, and on what evidence, is established by git
+history and pull-request review. This is not cryptographic identity verification.
+
+**Residual limits (recorded).** Python cannot stop deliberate forgery by code running in the
+same process. Code that names a private issuer key (for example, sealing a hand-built
+registry with `_REGISTRY_KEY`), monkeypatches a class or module, or uses `exec` can still
+forge objects or redirect the registry directory. The runtime checks stop accidental and
+convenient bypasses, including every route found in review (V1–V3, F1, F3). The
+architecture scan and review are relied on for deliberate ones; the scan is not proof.
 
 ### 5. Why qc_v1 is provisional and uncalibrated (implemented)
 
@@ -215,7 +289,10 @@ None of these were changed by this work.
 - **Existing hashes are unchanged.** Configuration and report hashes are untouched, and
   there are no stored snapshots to migrate.
 - **Report checks add a small cost.** Each report rebuilds its canonical JSON once more,
-  which is bounded by `max_listed` and independent of row count.
+  which is bounded by `max_listed` and independent of row count. `attest` judges the rows
+  once, as before, so freeze still makes a single pass.
+- **Freeze reports a quality FAIL before an oversized range.** The row-count limit is checked
+  on the attestation, after judging; either way nothing is written.
 
 ## Open questions
 

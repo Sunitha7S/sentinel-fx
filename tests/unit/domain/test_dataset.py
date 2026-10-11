@@ -73,7 +73,7 @@ GOLDEN = [
 
 def _record(spec: DatasetSpec = SPEC, rows: list[Candle] = GOLDEN) -> SnapshotRecord:
     """A record exactly as freeze() would store it: digest and quality judged together."""
-    a = attest(judge_dataset(spec, CFG, AS_OF, rows))
+    a = attest(spec, CFG, AS_OF, rows)
     return SnapshotRecord(
         snapshot_id="00000000-0000-0000-0000-000000000001",
         spec=spec,
@@ -316,7 +316,7 @@ def test_issuance_refuses_a_provisional_configuration_even_with_its_own_hash() -
     )
     with pytest.raises(DatasetError, match="only an APPROVED quality configuration"):
         issue_verified_dataset(record, GOLDEN, provisional)
-    with pytest.raises(DatasetError, match="only an APPROVED quality configuration"):
+    with pytest.raises(DatasetError, match="only a QualityConfig"):
         issue_verified_dataset(record, GOLDEN, None)  # type: ignore[arg-type]
 
 

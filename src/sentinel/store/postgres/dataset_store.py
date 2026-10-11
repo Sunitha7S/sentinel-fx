@@ -3,8 +3,8 @@
 ``freeze`` (``svc_market_data``) runs in one transaction holding the series' exclusive
 advisory lock, so no ingestion page can be in flight or start meanwhile. It checks the
 source against the registry, requires the range to end at or before the newest stored bar,
-then judges and digests every row in the range in one pass (``judge_dataset``) with the
-given quality configuration, at the transaction's own timestamp (``now()``, which is also
+then judges, digests and attests every row in the range in one pass (``attest``) with the
+trusted quality configuration, at the transaction's own timestamp (``now()``, which is also
 the record's ``created_at``). Only a PASS from an APPROVED configuration is attested and
 stored, so the rows judged are exactly the rows frozen. The database re-checks the source,
 range and row count (``check_snapshot``) and from then on refuses inserts inside the range.
@@ -126,8 +126,13 @@ class PostgresDatasetStore:
         refuse (``judge`` does not need it)."""
         if max_rows < 1:
             raise ValueError("max_rows must be positive")
-        if registry is not None and not isinstance(registry, QualityConfigRegistry):
-            raise DatasetError("registry must be a QualityConfigRegistry")
+        if registry is not None:
+            if type(registry) is not QualityConfigRegistry:
+                raise DatasetError("registry must be a QualityConfigRegistry (not a subclass)")
+            try:  # refused here, before freeze or load could reach the database
+                registry.verify()
+            except QualityConfigError as exc:
+                raise DatasetError(str(exc)) from exc
         self._engine = engine
         self._registry = registry
         self._max_rows = max_rows
@@ -136,7 +141,7 @@ class PostgresDatasetStore:
         """The registry's approved configuration with this hash, or refuse (fail closed)."""
         if self._registry is None:
             raise DatasetError(f"no trusted quality registry: cannot {what}")
-        try:
+        try:  # approved() also refuses a registry its loader did not issue
             return self._registry.approved(sha256)
         except QualityConfigError as exc:
             raise DatasetError(f"cannot {what}: {exc}") from exc
@@ -201,13 +206,13 @@ class PostgresDatasetStore:
                 raise DatasetError(f"this range is already frozen as snapshot {duplicate}")
             as_of = conn.execute(text("SELECT now()")).scalar_one().astimezone(UTC)
             with closing(self._stream(conn, spec)) as candles:
-                report = judge_dataset(spec, trusted, as_of, candles)
-            if report.digest.rows > self._max_rows:
+                # judges exactly these rows; refuses FAIL and unapproved configurations
+                attestation = attest(spec, trusted, as_of, candles)
+            if attestation.rows > self._max_rows:
                 raise DatasetError(
-                    f"{report.digest.rows:,} rows exceed the snapshot limit of "
+                    f"{attestation.rows:,} rows exceed the snapshot limit of "
                     f"{self._max_rows:,}; freeze a shorter range"
                 )
-            attestation = attest(report)  # refuses FAIL and unapproved configurations
             row = conn.execute(
                 text(
                     "INSERT INTO sentinel.dataset_snapshots (snapshot_id, format, symbol, "  # noqa: S608

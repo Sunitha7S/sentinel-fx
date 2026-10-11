@@ -79,7 +79,8 @@ REQUIRED_INVARIANTS: dict[str, str] = {
         "reproducible during verified load. That configuration's hash matches its content, it "
         "is APPROVED with exactly one matching approval record, and freeze and load obtain it "
         "only from the trusted registry loaded from the shipped directory (no registry, no "
-        "freeze or load); a quality report's fields, canonical JSON and hash agree."
+        "freeze or load); a quality report's fields, canonical JSON and hash agree; and an "
+        "attestation is issued only by judging the rows themselves, never from a report."
     ),
     "INV-EXEC-01": "Execution is disabled; live trading needs explicit, consistent enabling.",
 }
