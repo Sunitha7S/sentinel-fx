@@ -22,9 +22,12 @@ import pytest
 
 from sentinel.config.quality_loader import (
     APPROVALS_DIRNAME,
+    CANONICAL,
     QUALITY_CONFIG_DIR,
+    TRUST_ROOT_SHA256,
     ApprovalRecord,
     QualityConfigRegistry,
+    load_fixture_registry,
     load_quality_config,
     load_quality_registry,
     parse_approval_yaml,
@@ -178,7 +181,7 @@ def test_the_shipped_registry_holds_qc_v1_as_provisional_and_approves_nothing() 
 @pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_an_approved_configuration_with_its_record_is_trusted(tmp_path: Path) -> None:
     cfg, provisional = quality_config(), lenient_config(status=PROVISIONAL)
-    registry = load_quality_registry(write_configs(tmp_path, cfg, provisional))
+    registry = load_fixture_registry(write_configs(tmp_path, cfg, provisional))
     trusted = registry.approved(cfg.sha256)
     assert trusted == cfg
     assert trusted is registry.approved(cfg.sha256)  # always the registry's own object
@@ -192,7 +195,7 @@ def test_an_approved_configuration_with_its_record_is_trusted(tmp_path: Path) ->
 def test_an_approved_configuration_without_a_record_refuses_the_registry(tmp_path: Path) -> None:
     write_configs(tmp_path, quality_config(), lenient_config(), approve=[lenient_config()])
     with pytest.raises(QualityConfigError, match="qc_v900 is APPROVED but has no approval record"):
-        load_quality_registry(tmp_path)
+        load_fixture_registry(tmp_path)
 
 
 def _registry_with_record(tmp_path: Path, record: str, *configs: QualityConfig) -> None:
@@ -200,7 +203,7 @@ def _registry_with_record(tmp_path: Path, record: str, *configs: QualityConfig) 
     folder = tmp_path / APPROVALS_DIRNAME
     folder.mkdir(exist_ok=True)
     (folder / "record.yaml").write_text(record, encoding="utf-8")
-    load_quality_registry(tmp_path)
+    load_fixture_registry(tmp_path)
 
 
 @pytest.mark.invariant("INV-DATA-QUALITY-GATED")
@@ -229,7 +232,7 @@ def test_two_records_for_one_configuration_refuse_the_registry(tmp_path: Path) -
         approval_yaml(cfg, approved_by="someone-else"), encoding="utf-8"
     )
     with pytest.raises(QualityConfigError, match="approved twice"):
-        load_quality_registry(tmp_path)
+        load_fixture_registry(tmp_path)
 
 
 VALID = approval_yaml(quality_config())
@@ -274,7 +277,7 @@ def test_an_approvals_path_that_is_not_a_directory_refuses_the_registry(tmp_path
     write_configs(tmp_path, lenient_config(status=PROVISIONAL))
     (tmp_path / APPROVALS_DIRNAME).write_text("", encoding="utf-8")
     with pytest.raises(QualityConfigError, match="not a directory"):
-        load_quality_registry(tmp_path)
+        load_fixture_registry(tmp_path)
 
 
 def test_generated_config_files_round_trip_to_the_same_identity(tmp_path: Path) -> None:
@@ -291,7 +294,13 @@ def test_generated_config_files_round_trip_to_the_same_identity(tmp_path: Path) 
 def test_a_registry_cannot_be_built_copied_or_changed_outside_the_loader() -> None:
     cfg = quality_config()
     with pytest.raises(QualityConfigError, match="load_quality_registry"):
-        QualityConfigRegistry({cfg.sha256: cfg}, frozenset({cfg.sha256}), _key=object())
+        QualityConfigRegistry(
+            {cfg.sha256: cfg},
+            frozenset({cfg.sha256}),
+            trust_root=TRUST_ROOT_SHA256,
+            origin=CANONICAL,
+            _key=object(),
+        )
     registry = trusted_registry(cfg)
     with pytest.raises(TypeError):
         replace(registry, configs={})  # type: ignore[type-var]

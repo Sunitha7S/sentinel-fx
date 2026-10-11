@@ -12,6 +12,7 @@ import pytest
 from sentinel.cli import main
 from sentinel.config.quality_loader import (
     QUALITY_CONFIG_DIR,
+    load_fixture_registry,
     load_quality_config,
     load_quality_registry,
     parse_quality_yaml,
@@ -245,19 +246,19 @@ def test_registry_refuses_two_files_with_the_same_version_or_content(tmp_path: P
     (tmp_path / "qc_v1.yaml").write_text(TEXT, encoding="utf-8")
     (tmp_path / "copy.yaml").write_text(TEXT.replace("\n", "\r\n"), encoding="utf-8")
     with pytest.raises(QualityConfigError, match="same content"):
-        load_quality_registry(tmp_path)
+        load_fixture_registry(tmp_path)
     (tmp_path / "copy.yaml").write_text(
         TEXT.replace("    max_gap_bars: 15", "    max_gap_bars: 14", 1), encoding="utf-8"
     )
     with pytest.raises(QualityConfigError, match="qc_v1 is defined twice"):
-        load_quality_registry(tmp_path)
+        load_fixture_registry(tmp_path)
     (tmp_path / "copy.yaml").write_text("version: [", encoding="utf-8")
     with pytest.raises(QualityConfigError):
-        load_quality_registry(tmp_path)  # one bad file fails the whole registry
+        load_fixture_registry(tmp_path)  # one bad file fails the whole registry
     (tmp_path / "copy.yaml").unlink()
     (tmp_path / "qc_v1.yaml").unlink()
     with pytest.raises(QualityConfigError, match="no quality configuration"):
-        load_quality_registry(tmp_path)
+        load_fixture_registry(tmp_path)
 
 
 # ----------------------------------------------------------------------------- immutability

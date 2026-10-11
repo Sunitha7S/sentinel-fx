@@ -7,9 +7,15 @@
   attests, freezes or verifies.
 * Trust has one origin (ADR 0015): only the loader creates a ``QualityConfigRegistry`` or
   holds its key, production code loads the registry only from the shipped directory (a
-  direct call without arguments; no alias, ``partial`` or ``getattr``), no guarded class is
-  subclassed or allocated without its constructor, and the snapshot store takes a registry,
-  never a caller-supplied mapping of configurations.
+  direct call without arguments; no alias, ``partial`` or ``getattr``) and never names the
+  fixture loader, no guarded class (the snapshot store included) is subclassed or allocated
+  without its constructor, and the snapshot store takes a registry, never a caller-supplied
+  mapping of configurations.
+* Nothing rewrites trusted state from outside: no assignment or deletion of another object's
+  private attributes (``x._registry = ...``, ``setattr(x, "_engine", ...)``,
+  ``object.__setattr__(x, ...)``, ``x.__dict__[...]``, ``x.__class__ = ...``), no attribute
+  set by a computed name on another object, and no replacement of a security-sensitive
+  method or constant (``PostgresDatasetStore.freeze = ...``, ``TRUST_ROOT_SHA256 = ...``).
 
 These scans are a second line of defence that catches convenient bypasses in review. They
 cannot prove the absence of a deliberate one (string building, ``exec``); the runtime checks
@@ -43,14 +49,54 @@ PRIVATE: dict[str, Path] = {
     "_sealed": LOADER,
     "_load_approvals": LOADER,
     "_match_approvals": LOADER,
+    "_read_directory": LOADER,
+    "_require_test_session": LOADER,
+    "_in_test_session": LOADER,
+    "_TEST_RUNNER": LOADER,
+    "_trust_root": LOADER,
+    "_origin": LOADER,
     "_REPORT_KEY": DATASET,
     "_ATTESTATION_KEY": DATASET,
+    "_registry": STORE,
+    "_verified_registry": STORE,
+    "_approved_config": STORE,
+    "_store_registry": STORE,
 }
-"""Private issuance mechanisms and the only module that may name them."""
+"""Private issuance and authorisation mechanisms and the only module that may name them."""
 GUARDED = frozenset(
-    {"QualityConfigRegistry", "QualityConfig", "QualityReport", "QualityAttestation"}
+    {
+        "QualityConfigRegistry",
+        "QualityConfig",
+        "QualityReport",
+        "QualityAttestation",
+        "PostgresDatasetStore",
+    }
 )
 REGISTRY_LOADER = "load_quality_registry"
+FIXTURE_LOADER = "load_fixture_registry"
+SENSITIVE = frozenset(
+    {
+        "freeze",
+        "load",
+        "judge",
+        "approved",
+        "verify",
+        "resolve",
+        "attest",
+        "issue_verified_dataset",
+        REGISTRY_LOADER,
+        FIXTURE_LOADER,
+        "trust_root",
+        "QUALITY_CONFIG_DIR",
+        "TRUST_ROOT_SHA256",
+        "__init_subclass__",
+        "__setattr__",
+        "__delattr__",
+    }
+)
+"""Methods and constants whose replacement from outside would change what is authorised."""
+SETTERS = frozenset({"setattr", "delattr", "__setattr__", "__delattr__"})
+OWN = frozenset({"self", "cls"})
 BYPASS = re.compile(r"(force|override|bypass|skip|unsafe|ignore|allow_fail|unchecked|lenient)")
 ATTEST_CALL = re.compile(r"\battest\(")
 
@@ -79,6 +125,48 @@ def _ident(node: ast.AST) -> str:
     if isinstance(node, ast.Attribute):
         return node.attr
     return ""
+
+
+def _is_own(node: ast.AST) -> bool:
+    return isinstance(node, ast.Name) and node.id in OWN
+
+
+def _targets(node: ast.AST) -> list[ast.AST]:
+    """What an assignment or ``del`` statement writes, with tuple targets unpacked."""
+    pending: list[ast.AST] = []
+    if isinstance(node, ast.Assign | ast.Delete):
+        pending = list(node.targets)
+    elif isinstance(node, ast.AugAssign | ast.AnnAssign):
+        pending = [node.target]
+    targets: list[ast.AST] = []
+    while pending:
+        t = pending.pop()
+        if isinstance(t, ast.Tuple | ast.List):
+            pending += t.elts
+        else:
+            targets.append(t)
+    return targets
+
+
+def _rewrites(node: ast.AST) -> list[str]:
+    """Ways ``node`` rewrites another object's private state or a sensitive name."""
+    found: list[str] = []
+    for t in _targets(node):
+        if isinstance(t, ast.Attribute) and not _is_own(t.value):
+            if t.attr.startswith("_"):
+                found.append(f"assigns or deletes the private attribute {t.attr}")
+            if t.attr in SENSITIVE:
+                found.append(f"replaces the security-sensitive {t.attr}")
+        if isinstance(t, ast.Subscript) and _ident(t.value) == "__dict__":
+            found.append("writes an instance dictionary")
+    if isinstance(node, ast.Call) and _ident(node.func) in SETTERS and node.args:
+        target, name = node.args[0], node.args[1] if len(node.args) > 1 else None
+        if not _is_own(target):
+            if not (isinstance(name, ast.Constant) and isinstance(name.value, str)):
+                found.append(f"{_ident(node.func)} by a computed name on another object")
+            elif name.value.startswith("_") or name.value in SENSITIVE:
+                found.append(f"{_ident(node.func)} of {name.value} on another object")
+    return found
 
 
 def _mentions(text: str, name: str) -> bool:
@@ -116,6 +204,8 @@ def _boundary_violations(path: Path, rel: Path) -> list[str]:  # noqa: PLR0912 -
                 flag(node, f"{REGISTRY_LOADER} imported under an alias")
             if isinstance(node, ast.Constant) and node.value == REGISTRY_LOADER:
                 flag(node, f"{REGISTRY_LOADER} named as a string")
+            if any(_mentions(t, FIXTURE_LOADER) for t in texts):
+                flag(node, f"uses {FIXTURE_LOADER} (tests only)")
             if isinstance(node, ast.Call) and _ident(node.func) == "QualityConfigRegistry":
                 flag(node, "builds a QualityConfigRegistry")
         if isinstance(node, ast.ClassDef) and any(_ident(b) in GUARDED for b in node.bases):
@@ -134,6 +224,8 @@ def _boundary_violations(path: Path, rel: Path) -> list[str]:  # noqa: PLR0912 -
             flag(node, "allocates a guarded class without its constructor")
         if isinstance(node, ast.Call) and _ident(node.func) == "type" and len(node.args) == 3:
             flag(node, "creates a class dynamically")
+        for what in _rewrites(node):
+            flag(node, what)
     return found
 
 
@@ -229,6 +321,30 @@ EVASIONS = {
     "dynamic subclass": "Evil = type('Evil', (QualityConfigRegistry,), {})\n",
     "object.__new__ of a config": "c = object.__new__(QualityConfig)\n",
     "object.__new__ of a registry": "r = object.__new__(ql.QualityConfigRegistry)\n",
+    # N1/N5: the snapshot store and the state it authorises with
+    "store subclass overriding the hook": (
+        "class S(PostgresDatasetStore):\n    def _trusted(self, sha, what):\n        return c\n"
+    ),
+    "store subclass by type()": "S = type('S', (store_module.PostgresDatasetStore,), {})\n",
+    "store allocated without constructor": "s = object.__new__(PostgresDatasetStore)\n",
+    "store registry assigned": "store._registry = forged\n",
+    "store registry assigned by object.__setattr__": "object.__setattr__(s, '_registry', r)\n",
+    "store engine set by setattr": "setattr(store, '_engine', e)\n",
+    "private attribute set by computed name": "setattr(store, name, value)\n",
+    "private attribute deleted": "del store._max_rows\n",
+    "private attribute augmented": "store._max_rows += 1\n",
+    "private attribute in a tuple target": "a, store._engine = 1, e\n",
+    "class swapped": "store.__class__ = Other\n",
+    "instance dictionary written": "store.__dict__['x'] = r\n",
+    "freeze replaced": "PostgresDatasetStore.freeze = evil\n",
+    "verify replaced": "QualityConfigRegistry.verify = lambda self: self\n",
+    "approved replaced by setattr": "setattr(QualityConfigRegistry, 'approved', evil)\n",
+    "pinned trust root replaced": "quality_loader.TRUST_ROOT_SHA256 = digest\n",
+    "packaged directory redirected": "quality_loader.QUALITY_CONFIG_DIR = Path('x')\n",
+    "fixture loader called": "load_fixture_registry(Path('x'))\n",
+    "fixture loader imported": "from sentinel.config.quality_loader import load_fixture_registry\n",
+    "fixture loader by getattr": "getattr(ql, 'load_fixture_registry')(d)\n",
+    "test-session check named": "ql._require_test_session('x')\n",
 }
 ALLOWED = (
     "from sentinel.config.quality_loader import QualityConfigRegistry, load_quality_registry\n"
@@ -238,6 +354,15 @@ ALLOWED = (
     "    return type(r) is QualityConfigRegistry\n"
     'def g():\n    "load_quality_registry(d) and _REGISTRY_KEY in a docstring are fine"\n'
     "SQL = 'market_candles_sealed_range'\n"
+    "store = PostgresDatasetStore(engine, registry=load_quality_registry())\n"
+    "record = store.freeze(spec, quality)\n"
+    "class C:\n"
+    "    def __init__(self, v):\n"
+    "        self._v = v\n"
+    "        object.__setattr__(self, '_w', v)\n"
+    "        object.__setattr__(self, name, v)\n"
+    "        cls_like = self._v\n"
+    "options.freeze_time = True\n"
 )
 
 

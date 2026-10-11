@@ -4,6 +4,8 @@ Inspection (M1):
 
 * ``sentinel policy-hash PATH``   validate a policy file against code ceilings, print its hash
 * ``sentinel quality-hash PATH``  validate a data-quality configuration, print its identity
+* ``sentinel quality-registry``   verify the packaged quality configurations against the
+  pinned trust root; print it and every configuration. Exit 0 verified, 2 refused
 * ``sentinel audit-verify PATH``  verify a JSON-lines audit chain
 * ``sentinel settings [--env E]`` show effective settings and whether execution is permitted
 
@@ -35,7 +37,11 @@ from pathlib import Path
 from sentinel import __version__
 from sentinel.audit.chain import AuditChainError, verify_chain
 from sentinel.config.policy_loader import load_policy
-from sentinel.config.quality_loader import QUALITY_CONFIG_DIR, load_quality_config
+from sentinel.config.quality_loader import (
+    QUALITY_CONFIG_DIR,
+    load_quality_config,
+    load_quality_registry,
+)
 from sentinel.config.settings import SettingsError, load_settings
 from sentinel.domain.dataset import DatasetError, DatasetSpec
 from sentinel.domain.market_data import Timeframe
@@ -69,6 +75,11 @@ def build_parser() -> argparse.ArgumentParser:
         "quality-hash", help="validate a data-quality configuration and print its hash"
     )
     quality.add_argument("path", type=Path)
+
+    sub.add_parser(
+        "quality-registry",
+        help="verify the packaged quality configurations against the pinned trust root",
+    )
 
     audit = sub.add_parser("audit-verify", help="verify a JSON-lines audit chain")
     audit.add_argument("path", type=Path)
@@ -258,6 +269,23 @@ def _quality_hash(path: Path) -> int:
     return 0
 
 
+def _quality_registry() -> int:
+    try:
+        registry = load_quality_registry()
+    except QualityConfigError as exc:
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        return 2
+    print(f"trust root {registry.trust_root} ({QUALITY_CONFIG_DIR})")
+    for sha256, config in sorted(registry.configs.items(), key=lambda kv: kv[1].version):
+        try:
+            registry.approved(sha256)
+            approval = "approved"
+        except QualityConfigError:
+            approval = "not approved"
+        print(f"{config.version} {config.status} {sha256} {approval}")
+    return 0
+
+
 def _audit_verify(path: Path) -> int:
     try:
         count = verify_chain(JsonlAuditSink(path))
@@ -288,6 +316,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     handlers: dict[str, Callable[[], int]] = {
         "policy-hash": lambda: _policy_hash(args.path),
         "quality-hash": lambda: _quality_hash(args.path),
+        "quality-registry": _quality_registry,
         "audit-verify": lambda: _audit_verify(args.path),
         "settings": lambda: _settings(args.env),
         "provider-check": _provider_check,

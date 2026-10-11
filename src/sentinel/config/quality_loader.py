@@ -13,15 +13,24 @@ Approval (ADR 0015): ``status: APPROVED`` in a configuration is necessary but no
 configuration is approved only when ``approvals/`` next to the configurations holds exactly
 one approval record naming its exact hash and version, with the approver, the date and the
 evidence. The registry refuses to load at all if any APPROVED configuration lacks exactly
-one record, or any record names an unknown, stale or provisional configuration. Only
-``load_quality_registry`` creates a registry, and production code loads it only from the
-shipped directory (architecture test), so a configuration built or rehashed in memory can
-never become trusted by being handed to the registry or the snapshot store.
+one record, or any record names an unknown, stale or provisional configuration.
+
+Trust root: ``load_quality_registry()`` takes no arguments. It reads only the packaged
+``config/quality`` and refuses unless what it read (every configuration hash and every
+approval record) has the digest pinned in ``TRUST_ROOT_SHA256``, so the content that can
+authorise a snapshot is fixed by the reviewed source, wherever the files are read from.
+Registries over other directories come only from ``load_fixture_registry``; they are marked
+as fixtures and authorise nothing unless the process is a pytest session (the runtime image
+installs no test tooling). A configuration built or rehashed in memory never becomes trusted
+by being handed to the registry or the snapshot store.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+import sys
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -36,18 +45,33 @@ from sentinel.domain.quality import APPROVED, QualityConfig, QualityConfigError
 
 __all__ = [
     "APPROVALS_DIRNAME",
+    "CANONICAL",
+    "FIXTURE",
     "QUALITY_CONFIG_DIR",
+    "TRUST_ROOT_FORMAT",
+    "TRUST_ROOT_SHA256",
     "ApprovalRecord",
     "QualityConfigRegistry",
+    "load_fixture_registry",
     "load_quality_config",
     "load_quality_registry",
     "parse_approval_yaml",
     "parse_quality_yaml",
+    "trust_root",
 ]
 
-QUALITY_CONFIG_DIR = Path(__file__).resolve().parents[3] / "config" / "quality"
+QUALITY_CONFIG_DIR: Final = Path(__file__).resolve().parents[3] / "config" / "quality"
+"""The packaged configurations (``/app/config/quality`` in the image, docker/Dockerfile)."""
 APPROVALS_DIRNAME: Final = "approvals"
 """Approval records live in this subdirectory of the configuration directory, never apart."""
+TRUST_ROOT_FORMAT: Final = "sentinel-quality-trust-root/v1"
+TRUST_ROOT_SHA256: Final = "227fd71a6ece9ce0c667fbb3118f370c3ac358f1723f7d957d6bdb83e8bf77b2"
+"""Digest of the shipped configurations and approval records (``trust_root``). Adding an
+approval or a configuration changes it, in the same reviewed change; ``sentinel
+quality-registry`` prints the value the packaged files have."""
+CANONICAL: Final = "canonical"
+FIXTURE: Final = "fixture"
+_TEST_RUNNER: Final = "pytest"
 
 _APPROVAL_KEYS = ("config_version", "config_sha256", "approved_by", "approved_on", "evidence")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -216,21 +240,31 @@ def _match_approvals(
 
 
 class QualityConfigRegistry:
-    """Every shipped configuration by content hash, and which of them are approved.
+    """Every configuration of one directory by content hash, and which of them are approved.
 
-    Created only by ``load_quality_registry`` and read-only afterwards. It is not a
+    Created only by ``load_quality_registry`` (origin ``canonical``) or
+    ``load_fixture_registry`` (origin ``fixture``) and read-only afterwards. It is not a
     dataclass (``dataclasses.replace`` does not apply), it cannot be subclassed (a subclass
     could override ``approved``), and it carries a seal that only its key-checked
-    constructor sets, so an instance made with ``__new__`` authorises nothing. The snapshot
-    store additionally requires this exact type."""
+    constructor sets, so an instance made with ``__new__`` authorises nothing. A fixture
+    registry authorises nothing outside a test session. The snapshot store additionally
+    requires this exact type."""
 
-    __slots__ = ("_approved", "_configs", "_sealed")
+    __slots__ = ("_approved", "_configs", "_origin", "_sealed", "_trust_root")
     _configs: Mapping[str, QualityConfig]
     _approved: frozenset[str]
+    _origin: str
+    _trust_root: str
     _sealed: object
 
     def __init__(
-        self, configs: Mapping[str, QualityConfig], approved: frozenset[str], *, _key: object
+        self,
+        configs: Mapping[str, QualityConfig],
+        approved: frozenset[str],
+        *,
+        trust_root: str,
+        origin: str,
+        _key: object,
     ) -> None:
         if _key is not _REGISTRY_KEY:
             raise QualityConfigError(
@@ -238,6 +272,8 @@ class QualityConfigRegistry:
             )
         object.__setattr__(self, "_configs", MappingProxyType(dict(configs)))
         object.__setattr__(self, "_approved", frozenset(approved))
+        object.__setattr__(self, "_trust_root", trust_root)
+        object.__setattr__(self, "_origin", origin)
         object.__setattr__(self, "_sealed", _REGISTRY_KEY)
 
     def __init_subclass__(cls, **kwargs: object) -> None:
@@ -250,20 +286,37 @@ class QualityConfigRegistry:
         raise AttributeError("QualityConfigRegistry is read-only")
 
     @property
+    def origin(self) -> str:
+        """``canonical`` (the packaged, pinned directory) or ``fixture`` (tests only)."""
+        return self._origin
+
+    @property
+    def trust_root(self) -> str:
+        return self._trust_root
+
+    @property
     def configs(self) -> Mapping[str, QualityConfig]:
         return self._configs
 
     def verify(self) -> QualityConfigRegistry:
-        """Refuse unless ``load_quality_registry`` issued this exact object; return it.
+        """Refuse unless the loader issued this exact object and it may authorise here.
 
         An instance allocated with ``__new__``, or sealed with anything but the loader's
-        private key, authorises nothing."""
+        private key, authorises nothing; neither does a canonical registry whose trust root
+        is not the pinned one, nor a fixture registry outside a test session."""
         if type(self) is not QualityConfigRegistry or (
             getattr(self, "_sealed", None) is not _REGISTRY_KEY
         ):
             raise QualityConfigError(
                 "this registry was not issued by load_quality_registry; it authorises nothing"
             )
+        if self._origin == CANONICAL:
+            if self._trust_root != TRUST_ROOT_SHA256:
+                raise QualityConfigError(_trust_root_mismatch(self._trust_root))
+        elif self._origin == FIXTURE:
+            _require_test_session("a fixture registry")
+        else:
+            raise QualityConfigError(f"unknown registry origin {self._origin!r}")
         return self
 
     def approved(self, sha256: str) -> QualityConfig:
@@ -295,12 +348,51 @@ class QualityConfigRegistry:
         raise QualityConfigError(f"quality configuration {version} is not available")
 
 
-def load_quality_registry(directory: Path = QUALITY_CONFIG_DIR) -> QualityConfigRegistry:
-    """Load every ``*.yaml`` in ``directory`` and every approval record in its
-    ``approvals/``. Any invalid, conflicting or unmatched file fails all.
+def _in_test_session() -> bool:
+    return _TEST_RUNNER in sys.modules
 
-    Production code calls this without arguments (the shipped directory); only tests pass a
-    temporary directory (enforced by the INV-DATA-QUALITY-GATED architecture test)."""
+
+def _require_test_session(what: str) -> None:
+    if not _in_test_session():
+        raise QualityConfigError(
+            f"{what} authorises nothing outside a test session; production loads only the "
+            "packaged configuration (load_quality_registry())"
+        )
+
+
+def _trust_root_mismatch(actual: str) -> str:
+    return (
+        f"the quality configuration directory has trust root {actual}, not the pinned "
+        f"{TRUST_ROOT_SHA256}; it authorises nothing (a file absent, altered or added)"
+    )
+
+
+def trust_root(configs: Iterable[str], records: Iterable[tuple[Path, ApprovalRecord]]) -> str:
+    """SHA-256 of the canonical JSON of every configuration hash and every approval record.
+
+    Content only: file names, comments, key order and line endings do not change it."""
+    approvals = [
+        {
+            "config_version": r.config_version,
+            "config_sha256": r.config_sha256,
+            "approved_by": r.approved_by,
+            "approved_on": r.approved_on.isoformat(),
+            "evidence": r.evidence,
+        }
+        for _, r in records
+    ]
+    document = {
+        "format": TRUST_ROOT_FORMAT,
+        "configs": sorted(configs),
+        "approvals": sorted(approvals, key=lambda a: json.dumps(a, sort_keys=True)),
+    }
+    canonical = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("ascii")).hexdigest()
+
+
+def _read_directory(directory: Path) -> tuple[dict[str, QualityConfig], frozenset[str], str]:
+    """Every ``*.yaml`` in ``directory`` and every approval record in its ``approvals/``.
+    Any invalid, conflicting or unmatched file fails all."""
     configs: dict[str, QualityConfig] = {}
     versions: dict[str, Path] = {}
     for path in sorted(directory.glob("*.yaml")):
@@ -317,5 +409,29 @@ def load_quality_registry(directory: Path = QUALITY_CONFIG_DIR) -> QualityConfig
         versions[config.version] = path
     if not configs:
         raise QualityConfigError(f"no quality configuration found in {directory}")
-    approved = _match_approvals(configs, _load_approvals(directory))
-    return QualityConfigRegistry(configs, approved, _key=_REGISTRY_KEY)
+    records = _load_approvals(directory)
+    approved = _match_approvals(configs, records)
+    return configs, approved, trust_root(configs, records)
+
+
+def load_quality_registry() -> QualityConfigRegistry:
+    """The packaged configurations (``QUALITY_CONFIG_DIR``), only if they have the pinned
+    trust root. There is no directory argument: production cannot choose where approval
+    comes from, and a directory with any other content is refused."""
+    configs, approved, root = _read_directory(QUALITY_CONFIG_DIR)
+    if root != TRUST_ROOT_SHA256:
+        raise QualityConfigError(_trust_root_mismatch(root))
+    return QualityConfigRegistry(
+        configs, approved, trust_root=root, origin=CANONICAL, _key=_REGISTRY_KEY
+    )
+
+
+def load_fixture_registry(directory: Path) -> QualityConfigRegistry:
+    """A registry over a test directory, under the same rules but without the pinned trust
+    root. Refused outside a test session, and the registry it returns authorises nothing
+    outside one either (``verify``)."""
+    _require_test_session("load_fixture_registry")
+    configs, approved, root = _read_directory(directory)
+    return QualityConfigRegistry(
+        configs, approved, trust_root=root, origin=FIXTURE, _key=_REGISTRY_KEY
+    )

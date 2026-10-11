@@ -1,7 +1,7 @@
 # ADR 0015 — Data-quality gates and quality-configuration approval
 
 - **Status:** proposed (implementation and this record awaiting review)
-- **Date:** 2026-10-10
+- **Date:** 2026-10-10 (revised 2026-10-11 for review findings N1, N2, N3, N5)
 
 Each section is marked **implemented** (true of the code at this commit, enforced by
 runtime checks and tests), **procedural** (relies on people and review, not code) or
@@ -47,6 +47,23 @@ three gaps, closed by the hardening described in §3 and §4:
 - **F3:** a report relabelled with another configuration, with its canonical JSON and hash
   recomputed, was internally consistent and `attest()` accepted it, although the same rows
   FAILED under the configuration it named.
+
+A further independent review (of commit 7512546) found four more gaps, closed as described in
+§4:
+
+- **N1:** `PostgresDatasetStore` itself could be subclassed to override its `_trusted()`
+  hook, or have its `_registry` replaced after construction, so the store's own checks could
+  be bypassed while the registry stayed genuine.
+- **N2:** `load_quality_registry(directory)` accepted any directory at run time; only the
+  architecture scan stopped production code from authorising snapshots from one.
+- **N3:** the Docker image did not contain `config/quality` at all, and nothing defined how
+  a deployment obtains or verifies the approved configuration and approval records.
+- **N5:** the architecture scan did not cover store subclasses, overrides of
+  security-sensitive hooks, or assignments to protected private attributes.
+
+**ADR 0014 is absent.** At this commit no file `docs/adr/0014-*` exists in the working tree,
+in any local or remote branch, or anywhere in the history (`git log --all -- docs/adr/0014*`
+is empty), although code, tests and docs cite it. This ADR does not describe its contents.
 
 ## Decision
 
@@ -139,6 +156,15 @@ differs from its configuration's; or if any record is malformed. With no `approv
 directory, nothing is approved. `registry.approved(sha256)` returns the registry's own
 object for an approved hash and refuses anything else.
 
+**Threat model (decision, proposed).** The runtime checks below protect against ordinary
+mistakes and convenient bypasses by application code in this repository: a caller handing
+over a configuration, registry or store it built, copied, subclassed or modified with normal
+Python operations, or pointing the loader at a directory of its choice. They do **not**
+protect against hostile code with unrestricted access in the same process: such code can
+rewrite private slots with `object.__setattr__`, patch classes or module constants, name
+private keys, or use `exec`. That code is kept out by review, aided by the architecture scan.
+Python offers no in-process isolation that would do better.
+
 **Registry integrity (implemented, F1).** Runtime checks are authoritative:
 
 - The constructor requires the loader's private key and sets a seal to that key.
@@ -149,42 +175,132 @@ object for an approved hash and refuses anything else.
   three-argument `type()` alike), so `approved()` cannot be overridden.
 - It is not a dataclass (`dataclasses.replace` does not apply) and is read-only after
   construction (copying and pickling fail).
-- `PostgresDatasetStore` requires the exact type and calls `verify()` when it is
-  constructed, so a forged registry is refused before `freeze` or `load` can reach the
-  database.
+- Each registry records its **origin** (`canonical` or `fixture`) and its **trust root**
+  (below). `verify()` also refuses a canonical registry whose trust root is not the pinned
+  one, a fixture registry outside a test session, and any other origin.
 
-**Trusted origin (implemented; partly enforced by review).** The approvals directory is
-always the `approvals/` subdirectory of the configuration directory; it cannot be chosen
-separately. `load_quality_registry` still accepts a directory argument so tests can load
-temporary directories; nothing at run time stops a caller passing one. That production code
-calls it only without arguments, which means the shipped `config/quality/`, is enforced by
-the architecture scan (F2), not by the runtime.
+**Store integrity (implemented, N1).** `PostgresDatasetStore` is part of the boundary:
 
-The scan (`tests/architecture/test_quality_gated.py`) flags, outside the module that owns
-them:
+- It cannot be subclassed (`__init_subclass__` raises for `class` statements and
+  three-argument `type()`), so no method can be overridden by a subclass.
+- It has `__slots__` and no instance dictionary; `__setattr__` and `__delattr__` refuse after
+  construction, so `store._registry = x`, `setattr(store, "_engine", e)`,
+  `del store._registry` and `store.__class__ = C` all raise.
+- The overridable `_trusted()` hook is gone. Authorisation is decided by module functions
+  (`_store_registry`, `_verified_registry`, `_approved_config`) that a subclass or an instance attribute cannot
+  replace.
+- The registry is verified when the store is built, and again at the start of every
+  `freeze` and `load`, before any connection is opened. Even a registry slot rewritten with
+  `object.__setattr__` (outside the threat model) gains nothing unless the new object is
+  itself a registry that verifies. Regression tests prove that every refusal happens before
+  the engine is touched.
+
+**Approval directory (implemented, N2).** Production cannot choose where approval comes from.
+
+- `load_quality_registry()` takes **no arguments** (runtime: passing one is a `TypeError`).
+  It reads only `QUALITY_CONFIG_DIR`, the packaged `config/quality`. The approvals directory
+  is always its `approvals/` subdirectory.
+- It refuses unless the **trust root** of what it read equals `TRUST_ROOT_SHA256`, pinned in
+  `sentinel/config/quality_loader.py`. The trust root is the SHA-256 of the canonical JSON
+  (format `sentinel-quality-trust-root/v1`) of every configuration hash and every approval
+  record's fields. It depends on content only, not on file names, comments, key order or
+  line endings. Today it is `227fd71a6ece9ce0c667fbb3118f370c3ac358f1723f7d957d6bdb83e8bf77b2`:
+  `qc_v1` and no approval records.
+- Redirecting the directory therefore gains nothing. A directory with any other content
+  (an added configuration, an added or edited record, an altered threshold) is refused. A
+  missing directory is refused ("no quality configuration found"), and so nothing can be
+  frozen or loaded (fail closed).
+- Tests load temporary directories with `load_fixture_registry(directory)`. Its registries
+  are marked `fixture` and both the loader and `verify()` refuse them unless a test runner is
+  loaded in the process (`pytest` in `sys.modules`). The runtime image installs no test
+  tooling (`uv sync --no-dev`, asserted by a packaging test), so a fixture registry cannot
+  authorise a freeze or load there. A fixture registry obtained during a test and used after
+  the runner is unloaded is refused by the store, by `approved()` and by `verify()`.
+- Approving a configuration is therefore one reviewed change that adds the record **and**
+  updates `TRUST_ROOT_SHA256`. `sentinel quality-registry` prints the trust root that the
+  packaged files have, and a test fails until the pin matches.
+
+Options compared:
+
+| Option | Runtime enforcement | Test isolation | Cost |
+|---|---|---|---|
+| Keep the directory argument; rely on the scan (before) | none | trivial | none |
+| Environment variable selecting the directory | none: an operator can select any directory | easy | a runtime-selectable bypass |
+| Directory restricted to a path prefix | weak: anything that can write there can approve | awkward | path canonicalisation on every platform |
+| **No argument + pinned trust root + test-session-only fixture loader (chosen)** | content pinned in reviewed source; fixtures dead outside tests | separate loader | one pinned constant per approval change |
+| Signed approval records | cryptographic | test keys | key management, rotation, revocation |
+
+The test-session check is a deployment property, not a secret. Code that imports `pytest`
+in an environment where it is installed (a developer machine) can satisfy it. The image
+cannot, because it has no `pytest`. Even then, a fixture registry never carries the pinned
+trust root, so it cannot pass for the packaged one.
+
+**Deployment trust root (implemented, N3).** `docker/Dockerfile` copies `config/quality`
+into `/app/config/quality`, the path `QUALITY_CONFIG_DIR` resolves to next to `/app/src`.
+The files are owned by root and read-only to the runtime user `sentinel`.
+
+- **Build verification:** the build then runs `sentinel quality-registry`, which loads the
+  canonical registry. The build fails if the files are absent, malformed, inconsistent or do
+  not match the pinned trust root.
+- **No host content:** nothing is mounted. The Dockerfile has no `VOLUME` or `ADD`, and
+  compose mounts no configuration into the application.
+- **Identity:** what the image may authorise is identified by `TRUST_ROOT_SHA256` in the
+  image's own source, which comes from the reviewed commit the image was built from.
+- **Altered at run time:** if the files are altered or removed inside a running container
+  (which requires root in the container), the next registry load refuses and nothing can be
+  frozen or loaded.
+- **Packaging tests:** `tests/architecture/test_deployment_trust_root.py` asserts the copy
+  path, the order (copy, verify, then drop to the runtime user), `--no-dev --frozen`, the
+  absence of mounts, and that `config/quality` ships only files the trust root covers.
+- **Not yet done:** these tests read the Dockerfile. The image build itself has not been run
+  locally or in CI as part of this change.
+
+**What is verified, and how (procedural vs cryptographic).** The trust root is a content
+digest compared with a constant in the same source tree. It proves that the files the
+process reads are the files the reviewed commit pinned. It does **not** prove who approved
+them: anyone who can change both the files and the constant (a commit to `main`) can approve.
+The authority remains procedural (git history and pull-request review). Approval records are
+not signed, and the deployed image is identified only by the commit it was built from; image
+signing or digest pinning at deploy time is not implemented.
+
+The scan (`tests/architecture/test_quality_gated.py`, N5) is supplementary; runtime checks
+are authoritative. Outside the module that owns them, it flags:
 
 - any use of `load_quality_registry` other than a direct call without arguments (aliases,
-  `functools.partial`, `getattr` by name, import under another name);
-- any mention of the private issuance mechanisms (`_REGISTRY_KEY`, the registry seal,
-  `_load_approvals`, `_match_approvals`, `_REPORT_KEY`, `_ATTESTATION_KEY`), including
-  attribute access and string names;
-- subclasses of the guarded classes, `__new__` allocation of them, three-argument `type()`,
-  and building a `QualityConfigRegistry`.
+  `functools.partial`, `getattr` by name, import under another name), and any mention of
+  `load_fixture_registry`;
+- any mention of the private issuance and authorisation mechanisms: `_REGISTRY_KEY`, the
+  registry seal, origin and trust-root slots, `_load_approvals`, `_match_approvals`,
+  `_read_directory`, the test-session check, `_REPORT_KEY`, `_ATTESTATION_KEY`, and the
+  store's `_registry`, `_verified_registry`, `_approved_config` and `_store_registry`. Attribute
+  access and string names count too;
+- subclasses of the guarded classes (now including `PostgresDatasetStore`), `__new__`
+  allocation of them, three-argument `type()`, and building a `QualityConfigRegistry`;
+- in any module, assigning or deleting another object's private attribute (including tuple
+  and augmented assignment and `__class__`), writing an instance `__dict__`, and `setattr`,
+  `delattr`, `object.__setattr__` or `object.__delattr__` on another object with a private,
+  sensitive or computed name;
+- replacing a security-sensitive method or constant from outside, by assignment or
+  `setattr`: `freeze`, `load`, `judge`, `approved`, `verify`, `resolve`, `attest`,
+  `issue_verified_dataset`, the two loaders, `trust_root`, `QUALITY_CONFIG_DIR`,
+  `TRUST_ROOT_SHA256`, `__init_subclass__`, `__setattr__` and `__delattr__`.
 
-Each evasion has a regression fixture. A static scan cannot prove the absence of a
-deliberate bypass (string building, `exec`); it is a second line of defence.
+Each evasion has a regression fixture, and legitimate patterns (`self._x = ...`,
+`object.__setattr__(self, ...)`, building a store with the canonical registry) have an
+allow fixture. A static scan cannot prove the absence of a deliberate bypass (string
+building, `exec`); it is a second line of defence.
 
 **Store enforcement (implemented).** `PostgresDatasetStore` takes `registry=`; there is no
 longer a caller-supplied mapping of configurations.
 
-- `freeze` refuses without a registry. It also refuses any configuration that
+- `freeze` refuses without a registry that verifies. It also refuses any configuration that
   `registry.approved()` does not return, or that is not the very object the registry
   returned. All of this happens before the database is touched, so nothing is written and
   no range is sealed. It then calls `attest` with the registry's object, which judges the
   rows under the transaction's lock.
-- `load` refuses without a registry and verifies only under `registry.approved()` for the
-  snapshot's recorded configuration hash. `issue_verified_dataset` also requires an APPROVED
-  configuration.
+- `load` refuses without a registry that verifies, before opening a connection, and
+  verifies only under `registry.approved()` for the snapshot's recorded configuration hash.
+  `issue_verified_dataset` also requires an APPROVED configuration.
 - `judge`, used by `sentinel data-gate`, needs no registry and accepts provisional
   configurations: a report is a diagnostic, not authority.
 
@@ -203,6 +319,8 @@ contributor, it is in practice self-review with an audit trail, not separation o
   `docs/07-deployment-and-api.md` describes step-up for dangerous endpoints. It is a
   candidate successor.
 - *Signed approvals:* key management is out of scope.
+- *A runtime-selectable configuration directory* (argument or environment variable): it
+  would let the deployment, rather than the reviewed source, decide what is approved (N2).
 
 **Approval evidence is procedural and hash-bound (procedural).** A record binds a decision
 to one exact configuration hash. `approved_by`, `approved_on` and `evidence` are free text
@@ -210,12 +328,24 @@ that the loader checks only for form: it verifies no identity, no signature and 
 existence of the evidence. Who approved, and on what evidence, is established by git
 history and pull-request review. This is not cryptographic identity verification.
 
-**Residual limits (recorded).** Python cannot stop deliberate forgery by code running in the
-same process. Code that names a private issuer key (for example, sealing a hand-built
-registry with `_REGISTRY_KEY`), monkeypatches a class or module, or uses `exec` can still
-forge objects or redirect the registry directory. The runtime checks stop accidental and
-convenient bypasses, including every route found in review (V1–V3, F1, F3). The
-architecture scan and review are relied on for deliberate ones; the scan is not proof.
+**Residual limits (recorded).**
+
+- **Hostile in-process code:** Python cannot stop deliberate forgery by code running in the
+  same process. Such code can still forge objects or change what is trusted:
+  - it can name a private issuer key, for example sealing a hand-built registry with
+    `_REGISTRY_KEY` and origin `canonical` and the pinned root;
+  - it can rewrite slots with `object.__setattr__`, or monkeypatch a class, a method,
+    `TRUST_ROOT_SHA256` or `QUALITY_CONFIG_DIR` (though a redirected directory still has to
+    match the pin);
+  - it can import `pytest` where it is installed, or use `exec`.
+
+  The runtime checks stop accidental and convenient bypasses, including every route found in
+  review (V1–V3, F1, F3, N1, N2). The architecture scan and review are relied on for
+  deliberate ones; the scan is not proof.
+- **Class-level patching:** assigning to a class attribute (`PostgresDatasetStore.freeze = f`)
+  is not refused at run time. That would need a metaclass, and it is left to the scan.
+- **The pin authenticates content, not people;** see above.
+- **Image build:** the image build is not yet exercised in CI.
 
 ### 5. Why qc_v1 is provisional and uncalibrated (implemented)
 
@@ -283,11 +413,18 @@ None of these were changed by this work.
 - **Configurations and records are append-only in practice.** Removing or editing a
   configuration file, or its approval record, makes every snapshot judged under it
   unloadable (fail closed).
-- **Tests build their own registries.** Tests that freeze or load must load a registry from
-  a temporary directory holding their configurations and approval records
-  (`tests/support/quality.py`). Engine and attestation tests judge without a registry.
-- **Existing hashes are unchanged.** Configuration and report hashes are untouched, and
-  there are no stored snapshots to migrate.
+- **Tests build their own registries.** Tests that freeze or load use a fixture registry
+  (`load_fixture_registry`, via `tests/support/quality.py`) over a temporary directory
+  holding their configurations and approval records; it authorises only inside a test
+  session. Engine and attestation tests judge without a registry.
+- **An approval is a code change.** Adding an approval record, or any configuration, changes
+  the trust root, so the same reviewed change must update `TRUST_ROOT_SHA256`. Until it
+  does, the registry refuses to load and the image does not build.
+- **The image now carries `config/quality`.** Before this change it did not, so no
+  container could have frozen or loaded a snapshot. The build now fails unless the files
+  match the pin.
+- **Existing hashes are unchanged.** Configuration and report hashes are untouched (the trust
+  root is a new, separate digest), and there are no stored snapshots to migrate.
 - **Report checks add a small cost.** Each report rebuilds its canonical JSON once more,
   which is bounded by `max_listed` and independent of row count. `attest` judges the rows
   once, as before, so freeze still makes a single pass.
@@ -305,8 +442,16 @@ None of these were changed by this work.
 4. Fix the decimal precision locally in engine v1 now (its output is unchanged at the
    default precision), or leave it for a future v2?
 5. The 1,000,000-row snapshot limit, and how long freeze holds the series lock.
-6. ADR 0014 (dataset snapshots), which code and this ADR cite: write it, or confirm its
-   status, before this ADR is accepted.
+6. ADR 0014 (dataset snapshots), which code and this ADR cite, does not exist in the
+   repository or its history: write it before this ADR is accepted, or remove the citations.
 7. The comment in `qc_v1.yaml` says approval "sets `status: APPROVED`". Under §4, approval
    also needs a record. The comment was left untouched in this change (comments do not
    affect the hash); update it with the approval change.
+8. Accept "pytest loaded in the process" as the test-session signal for fixture registries,
+   or move fixture issuance out of the shipped package entirely (a larger change to how
+   tests obtain registries)?
+9. Should deployment verify more than the build does, for example pin and verify the image
+   digest at deploy time, or sign approval records or images? Today identity is "the image
+   built from a reviewed commit".
+10. Build the image in CI so that the build-time trust-root check is exercised, not only read
+    by the packaging tests.

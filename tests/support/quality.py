@@ -13,7 +13,7 @@ import yaml
 from sentinel.config.quality_loader import (
     APPROVALS_DIRNAME,
     QualityConfigRegistry,
-    load_quality_registry,
+    load_fixture_registry,
 )
 from sentinel.domain.quality import APPROVED, QUALITY_CALENDAR, QUALITY_ENGINE, QualityConfig
 
@@ -126,7 +126,7 @@ def write_configs(
 
 
 def trusted_registry(*configs: QualityConfig) -> QualityConfigRegistry:
-    """A registry loaded, the only way there is, from a temporary directory holding
+    """A fixture registry (tests only) loaded from a temporary directory holding
     ``configs`` and an approval record for each APPROVED one."""
     with tempfile.TemporaryDirectory() as tmp:
-        return load_quality_registry(write_configs(Path(tmp), *configs))
+        return load_fixture_registry(write_configs(Path(tmp), *configs))
