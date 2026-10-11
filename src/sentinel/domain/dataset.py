@@ -14,10 +14,15 @@ hash on every machine, OS, Python version and database:
 
 Quality (engine v1, ``sentinel.domain.quality``): ``judge_dataset`` runs the quality gates
 and the digest over the *same* rows in one pass and issues a ``QualityReport`` bound to the
-dataset identity, the exact configuration and the evaluation time. Only ``attest`` turns a
-PASS report from an APPROVED configuration into a ``QualityAttestation``; neither can be
-constructed any other way. A stored record carries only the ``QualityProvenance`` (verdict,
-report hash, configuration hash), which verification later reproduces.
+dataset identity, the exact configuration and the evaluation time; a report whose fields,
+canonical JSON and hash disagree cannot exist. A report is integrity-checked data, not
+authority: ``attest`` takes rows, not a report, judges them itself and issues a
+``QualityAttestation`` only for a PASS under an APPROVED configuration, so no report, however
+built or relabelled, becomes an attestation. Neither can be constructed any other way.
+Whether an APPROVED configuration is *trusted* (ADR 0015) is decided by the registry the
+snapshot store holds.
+A stored record carries only the ``QualityProvenance`` (verdict, report hash, configuration
+hash), which verification later reproduces.
 
 Research code never reads raw candles. It receives a ``VerifiedDataset``, which only
 ``issue_verified_dataset`` can create, and only after recomputing the digest of the rows it
@@ -37,9 +42,15 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Final
 
-from sentinel.domain.canonical import canonical, canonical_json
+from sentinel.domain.canonical import JsonValue, canonical, canonical_json
 from sentinel.domain.market_data import Candle, Timeframe
-from sentinel.domain.quality import APPROVED, QualityChecker, QualityConfig, QualityResult
+from sentinel.domain.quality import (
+    APPROVED,
+    QualityChecker,
+    QualityConfig,
+    QualityConfigError,
+    QualityResult,
+)
 from sentinel.domain.types import DomainError, require_utc
 
 __all__ = [
@@ -228,9 +239,31 @@ class QualityReport:
     sha256: str
     _key: object = field(repr=False, compare=False)
 
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("QualityReport cannot be subclassed")
+
     def __post_init__(self) -> None:
+        """The issuer key alone survives ``dataclasses.replace``; the content checks do not.
+        Every field must agree with the canonical JSON, and the JSON with the hash.
+
+        Integrity, not authenticity: a report proves nothing by itself. ``attest`` never
+        accepts one (it judges the rows itself) and verified load re-judges the rows."""
         if self._key is not _REPORT_KEY:
             raise DatasetError("a QualityReport can only be issued by judge_dataset")
+        typed = (
+            (self.spec, DatasetSpec),
+            (self.digest, DatasetDigest),
+            (self.config, QualityConfig),
+            (self.result, QualityResult),
+            (self.as_of, datetime),
+        )
+        if not all(isinstance(value, kind) for value, kind in typed):
+            raise DatasetError("a QualityReport's fields have the wrong types")
+        body = _report_body(self.spec, self.digest, self.config, self.as_of, self.result)
+        if canonical_json(body) != self.canonical_json:
+            raise DatasetError("quality report fields do not match its canonical JSON")
+        if hashlib.sha256(self.canonical_json.encode("ascii")).hexdigest() != self.sha256:
+            raise DatasetError("quality report hash does not match its canonical JSON")
 
     @property
     def verdict(self) -> str:
@@ -239,6 +272,35 @@ class QualityReport:
     @property
     def passed(self) -> bool:
         return self.result.passed
+
+
+def _report_body(
+    spec: DatasetSpec,
+    digest: DatasetDigest,
+    config: QualityConfig,
+    as_of: datetime,
+    result: QualityResult,
+) -> dict[str, JsonValue]:
+    """The canonical report layout of engine v1 (pinned by the golden reports)."""
+    return {
+        "format": QUALITY_REPORT_FORMAT,
+        "engine": config.engine,
+        "calendar": config.calendar,
+        "config": {"version": config.version, "status": config.status, "sha256": config.sha256},
+        "dataset": {
+            "format": DATASET_FORMAT,
+            "symbol": spec.symbol,
+            "timeframe": spec.timeframe.value,
+            "source": spec.source,
+            "from": format_ts(spec.start),
+            "to": format_ts(spec.end),
+            "rows": digest.rows,
+            "rows_sha256": digest.rows_sha256,
+            "sha256": digest.sha256,
+        },
+        "as_of": format_ts(as_of),
+        "result": result.canonical(),
+    }
 
 
 def judge_dataset(
@@ -264,26 +326,7 @@ def judge_dataset(
         digester.add(c)
     digest = digester.finish()
     result = checker.finish()
-    body = {
-        "format": QUALITY_REPORT_FORMAT,
-        "engine": config.engine,
-        "calendar": config.calendar,
-        "config": {"version": config.version, "status": config.status, "sha256": config.sha256},
-        "dataset": {
-            "format": DATASET_FORMAT,
-            "symbol": spec.symbol,
-            "timeframe": spec.timeframe.value,
-            "source": spec.source,
-            "from": format_ts(spec.start),
-            "to": format_ts(spec.end),
-            "rows": digest.rows,
-            "rows_sha256": digest.rows_sha256,
-            "sha256": digest.sha256,
-        },
-        "as_of": format_ts(as_of),
-        "result": result.canonical(),
-    }
-    text = canonical_json(body)
+    text = canonical_json(_report_body(spec, digest, config, as_of, result))
     return QualityReport(
         spec=spec,
         digest=digest,
@@ -296,11 +339,21 @@ def judge_dataset(
     )
 
 
-@dataclass(frozen=True, slots=True)
 class QualityAttestation:
     """A PASS judgement bound to one dataset identity, configuration and report. Issued only
-    by ``attest``; the only thing a snapshot can be frozen with."""
+    by ``attest``, from rows it judged itself; the only thing a snapshot can be frozen with.
 
+    Not a dataclass (``dataclasses.replace`` does not apply), not subclassable, read-only."""
+
+    __slots__ = (
+        "config_sha256",
+        "config_version",
+        "report_sha256",
+        "rows",
+        "rows_sha256",
+        "sha256",
+        "spec",
+    )
     spec: DatasetSpec
     rows: int
     rows_sha256: str
@@ -308,43 +361,75 @@ class QualityAttestation:
     config_version: str
     config_sha256: str
     report_sha256: str
-    _key: object = field(repr=False, compare=False)
 
-    def __post_init__(self) -> None:
-        if self._key is not _ATTESTATION_KEY:
+    def __init__(self, report: QualityReport, *, _key: object) -> None:
+        if _key is not _ATTESTATION_KEY:
             raise DatasetError(
-                "a QualityAttestation can only be issued by attest() from a PASS report"
+                "a QualityAttestation can only be issued by attest(), which judges the rows"
             )
+        for name, value in (
+            ("spec", report.spec),
+            ("rows", report.digest.rows),
+            ("rows_sha256", report.digest.rows_sha256),
+            ("sha256", report.digest.sha256),
+            ("config_version", report.config.version),
+            ("config_sha256", report.config.sha256),
+            ("report_sha256", report.sha256),
+        ):
+            object.__setattr__(self, name, value)
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("QualityAttestation cannot be subclassed")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("QualityAttestation is read-only")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("QualityAttestation is read-only")
+
+    def __repr__(self) -> str:
+        return (
+            f"QualityAttestation({self.spec.symbol} {self.spec.timeframe.value} "
+            f"{self.sha256[:12]}, config {self.config_version} {self.config_sha256[:12]})"
+        )
 
     @property
     def provenance(self) -> QualityProvenance:
         return QualityProvenance(PASS, self.report_sha256, self.config_sha256)
 
 
-def attest(report: QualityReport) -> QualityAttestation:
-    """Attest a PASS report judged against an APPROVED configuration. No other path exists."""
-    if not isinstance(report, QualityReport):
-        raise DatasetError("only a QualityReport issued by judge_dataset can be attested")
+def _verified(config: object, what: str) -> QualityConfig:
+    """``config`` re-checked as a genuine QualityConfig whose hash matches its content."""
+    if type(config) is not QualityConfig:
+        raise DatasetError(f"only a QualityConfig can {what}")
+    try:
+        return config.verify()
+    except QualityConfigError as exc:
+        raise DatasetError(f"cannot {what}: {exc}") from exc
+
+
+def attest(
+    spec: DatasetSpec, config: QualityConfig, as_of: datetime, candles: Iterable[Candle]
+) -> QualityAttestation:
+    """Judge ``candles`` under ``config`` and attest a PASS. No other path exists.
+
+    Judging and attesting are one call: an attestation is only ever issued for rows this
+    function judged itself under the configuration it names, so no report object, however
+    built or relabelled, can be turned into an attestation. ``config`` must be an APPROVED
+    ``QualityConfig`` (not a subclass); whether it is *trusted* is the store's decision."""
+    _verified(config, "attest a snapshot")
+    if config.status != APPROVED:
+        raise DatasetError(
+            f"quality configuration {config.version} is {config.status}; only an "
+            f"{APPROVED} configuration can attest a snapshot"
+        )
+    report = judge_dataset(spec, config, as_of, candles)
     if not report.passed:
         gates = ", ".join(f.gate for f in report.result.failures)
         raise DatasetError(
             f"quality verdict {report.verdict} ({gates}); the range cannot be frozen"
         )
-    if report.config.status != APPROVED:
-        raise DatasetError(
-            f"quality configuration {report.config.version} is {report.config.status}; only an "
-            f"{APPROVED} configuration can attest a snapshot"
-        )
-    return QualityAttestation(
-        spec=report.spec,
-        rows=report.digest.rows,
-        rows_sha256=report.digest.rows_sha256,
-        sha256=report.digest.sha256,
-        config_version=report.config.version,
-        config_sha256=report.config.sha256,
-        report_sha256=report.sha256,
-        _key=_ATTESTATION_KEY,
-    )
+    return QualityAttestation(report, _key=_ATTESTATION_KEY)
 
 
 @dataclass(frozen=True, slots=True)
@@ -398,7 +483,13 @@ def issue_verified_dataset(
 ) -> VerifiedDataset:
     """Recompute the digest and the quality report of ``candles``; issue a VerifiedDataset
     only if both match the record exactly. ``quality`` must be the configuration the record
-    names (by hash); any other is refused."""
+    names (by hash), and APPROVED; any other is refused. Whether it is *trusted* (a matching
+    approval record) is decided by the trusted registry, which the store consults first."""
+    if _verified(quality, "verify a snapshot").status != APPROVED:
+        raise DatasetError(
+            f"snapshot {record.snapshot_id}: only an {APPROVED} quality configuration can "
+            "verify a snapshot"
+        )
     if quality.sha256 != record.quality.config_sha256:
         raise DatasetError(
             f"snapshot {record.snapshot_id}: quality configuration mismatch (the snapshot was "
