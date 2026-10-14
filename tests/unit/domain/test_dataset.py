@@ -31,6 +31,7 @@ from sentinel.domain.dataset import (
     judge_dataset,
 )
 from sentinel.domain.market_data import OHLC, Candle, Timeframe
+from sentinel.domain.quality import PROVISIONAL
 from sentinel.domain.types import DomainError
 
 from support.market import candle, minutes
@@ -72,7 +73,7 @@ GOLDEN = [
 
 def _record(spec: DatasetSpec = SPEC, rows: list[Candle] = GOLDEN) -> SnapshotRecord:
     """A record exactly as freeze() would store it: digest and quality judged together."""
-    a = attest(judge_dataset(spec, CFG, AS_OF, rows))
+    a = attest(spec, CFG, AS_OF, rows)
     return SnapshotRecord(
         snapshot_id="00000000-0000-0000-0000-000000000001",
         spec=spec,
@@ -303,6 +304,20 @@ def test_issuance_requires_the_snapshots_own_quality_configuration() -> None:
         issue_verified_dataset(record, GOLDEN, other)
     with pytest.raises(DatasetError, match="quality configuration mismatch"):
         issue_verified_dataset(record, GOLDEN, quality_config())
+
+
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
+def test_issuance_refuses_a_provisional_configuration_even_with_its_own_hash() -> None:
+    provisional = lenient_config(status=PROVISIONAL)
+    report = judge_dataset(SPEC, provisional, AS_OF, GOLDEN)
+    assert report.passed
+    record = replace(
+        _record(), quality=QualityProvenance("PASS", report.sha256, provisional.sha256)
+    )
+    with pytest.raises(DatasetError, match="only an APPROVED quality configuration"):
+        issue_verified_dataset(record, GOLDEN, provisional)
+    with pytest.raises(DatasetError, match="only a QualityConfig"):
+        issue_verified_dataset(record, GOLDEN, None)  # type: ignore[arg-type]
 
 
 @pytest.mark.invariant("INV-DATA-SNAPSHOT")

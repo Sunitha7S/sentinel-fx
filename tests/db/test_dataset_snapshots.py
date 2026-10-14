@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
 
@@ -20,7 +21,11 @@ from psycopg import errors as pg
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
-from sentinel.config.quality_loader import QUALITY_CONFIG_DIR, load_quality_config
+from sentinel.config.quality_loader import (
+    QUALITY_CONFIG_DIR,
+    load_quality_config,
+    parse_quality_yaml,
+)
 from sentinel.domain.dataset import (
     DatasetError,
     DatasetSpec,
@@ -29,25 +34,28 @@ from sentinel.domain.dataset import (
     judge_dataset,
 )
 from sentinel.domain.market_data import Candle, Timeframe
+from sentinel.domain.quality import APPROVED, PROVISIONAL, QualityConfig
 from sentinel.store.postgres.dataset_store import SERIES_LOCK_CLASS, PostgresDatasetStore
 from sentinel.store.postgres.engine import OWNER_ROLE, SERVICE_ROLES
 from sentinel.store.postgres.market_data_store import PostgresMarketDataStore
 
 from db.conftest import Db
 from support.market import candle, minutes
-from support.quality import lenient_config, quality_config
+from support.quality import config_yaml, lenient_config, quality_config, trusted_registry
 
 MON = datetime(2015, 1, 5, tzinfo=UTC)
 SRC = "oanda-practice"
-PASS = lenient_config()
+REGISTRY = trusted_registry(lenient_config(), quality_config())
+"""Loaded from a temporary directory with an approval record per configuration (test-only;
+nothing is shipped). freeze accepts only the registry's own objects."""
+PASS = REGISTRY.approved(lenient_config().sha256)
 """Tests here are about storage, sealing and locking; quality gates are tested in their own
 module. Integrity gates still apply; only completeness thresholds are relaxed."""
-STRICT = quality_config()
-CONFIGS = {c.sha256: c for c in (PASS, STRICT)}
+STRICT = REGISTRY.approved(quality_config().sha256)
 
 
 def _store(db: Db, role: str = "svc_market_data", **kw: object) -> PostgresDatasetStore:
-    return PostgresDatasetStore(db.engine(role), quality_configs=CONFIGS, **kw)  # type: ignore[arg-type]
+    return PostgresDatasetStore(db.engine(role), registry=REGISTRY, **kw)  # type: ignore[arg-type]
 
 
 def _bars(n: int, start: datetime = MON, symbol: str = "EUR_USD") -> list[Candle]:
@@ -163,33 +171,76 @@ def test_freeze_refuses_a_failing_range_and_writes_nothing(db: Db) -> None:
     md.insert([*bars[:10], *bars[30:]], SRC)  # a 20-minute hole
     ds = _store(db, "svc_market_data")
     with pytest.raises(DatasetError, match=r"FAIL.*completeness_below_min, gap_above_max"):
-        ds.freeze(_spec(0, 59), quality_config())
+        ds.freeze(_spec(0, 59), STRICT)
     assert _snapshots(db) == 0
     md.insert([candle("EUR_USD", MON + timedelta(minutes=60))], SRC)  # range not sealed
 
 
 @pytest.mark.invariant("INV-DATA-QUALITY-GATED")
-def test_freeze_refuses_an_unapproved_configuration(db: Db) -> None:
-    _, ds = _seeded(db)
+def test_freeze_refuses_an_unapproved_or_untrusted_configuration_and_writes_nothing(
+    db: Db,
+) -> None:
+    md = PostgresMarketDataStore(db.engine("svc_market_data"))
+    bars = _bars(30)
+    md.insert([*bars[:10], *bars[11:]], SRC)  # minute 10 arrives later
+    ds = _store(db, "svc_market_data")
     qc_v1 = load_quality_config(QUALITY_CONFIG_DIR / "qc_v1.yaml")  # PROVISIONAL / UNCALIBRATED
-    with pytest.raises(DatasetError, match="PROVISIONAL_UNCALIBRATED"):
-        ds.freeze(_spec(0, 20), qc_v1)
-    with pytest.raises(DatasetError, match="quality configuration is required"):
-        ds.freeze(_spec(0, 20), None)  # type: ignore[arg-type]
+    approved_qc_v1 = replace(  # V1 with an honestly recomputed hash: still never reviewed
+        qc_v1, status=APPROVED, sha256=_approved_hash(qc_v1)
+    )
+    for quality, match in (
+        (qc_v1, "not available"),
+        (approved_qc_v1, "not available"),
+        (quality_config(max_gap_bars=16), "not available"),  # APPROVED, honest, no record
+        (quality_config(), "not obtained from the trusted registry"),  # a copy of STRICT
+        (None, "quality configuration is required"),
+    ):
+        with pytest.raises(DatasetError, match=match):
+            ds.freeze(_spec(0, 20), quality)  # type: ignore[arg-type]
+    untrusted = PostgresDatasetStore(db.engine("svc_market_data"))
+    with pytest.raises(DatasetError, match="no trusted quality registry"):
+        untrusted.freeze(_spec(0, 20), STRICT)
     assert _snapshots(db) == 0
+    md.insert([bars[10]], SRC)  # the range was never sealed
+
+
+def _approved_hash(config: QualityConfig) -> str:
+    text = config_yaml(config).replace(f"status: {config.status}", f"status: {APPROVED}", 1)
+    return parse_quality_yaml(text).sha256
 
 
 @pytest.mark.invariant("INV-DATA-SNAPSHOT")
 @pytest.mark.invariant("INV-DATA-QUALITY-GATED")
 def test_load_refuses_a_snapshot_whose_quality_configuration_it_does_not_hold(db: Db) -> None:
-    """Never re-judged under whatever configuration is current: only under its own."""
+    """Never re-judged under whatever configuration is current: only under its own, and only
+    while the trusted registry still approves it."""
     _, ds = _seeded(db)
     record = ds.freeze(_spec(0, 20), STRICT)
-    for configs in ({}, {PASS.sha256: PASS}):
-        reader = PostgresDatasetStore(db.engine("svc_learning"), quality_configs=configs)
-        with pytest.raises(DatasetError, match="not available"):
+    for registry, match in (
+        (None, "no trusted quality registry"),
+        (trusted_registry(lenient_config()), "not available"),
+        (trusted_registry(quality_config(status=PROVISIONAL)), "not available"),
+    ):
+        reader = PostgresDatasetStore(db.engine("svc_learning"), registry=registry)
+        with pytest.raises(DatasetError, match=match):
             reader.load(record.snapshot_id)
     assert len(_store(db, "svc_learning").load(record.snapshot_id)) == 20
+
+
+@pytest.mark.invariant("INV-DATA-SNAPSHOT")
+@pytest.mark.invariant("INV-DATA-QUALITY-GATED")
+def test_a_trusted_freeze_and_load_reproduce_the_same_report_hash(db: Db) -> None:
+    _, ds = _seeded(db)
+    spec = _spec(0, 20)
+    record = ds.freeze(spec, STRICT)
+    expected = judge_dataset(spec, STRICT, record.created_at, _bars(20)).sha256
+    assert record.quality.report_sha256 == expected
+    fresh = trusted_registry(lenient_config(), quality_config())  # loaded again, same files
+    loaded = PostgresDatasetStore(db.engine("svc_learning"), registry=fresh).load(
+        record.snapshot_id
+    )
+    assert loaded.record.quality.report_sha256 == expected
+    assert loaded.record.quality.config_sha256 == STRICT.sha256
 
 
 # ----------------------------------------------------------------------------- freeze fails closed

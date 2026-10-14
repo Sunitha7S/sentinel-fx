@@ -3,8 +3,8 @@
 ``freeze`` (``svc_market_data``) runs in one transaction holding the series' exclusive
 advisory lock, so no ingestion page can be in flight or start meanwhile. It checks the
 source against the registry, requires the range to end at or before the newest stored bar,
-then judges and digests every row in the range in one pass (``judge_dataset``) with the
-given quality configuration, at the transaction's own timestamp (``now()``, which is also
+then judges, digests and attests every row in the range in one pass (``attest``) with the
+trusted quality configuration, at the transaction's own timestamp (``now()``, which is also
 the record's ``created_at``). Only a PASS from an APPROVED configuration is attested and
 stored, so the rows judged are exactly the rows frozen. The database re-checks the source,
 range and row count (``check_snapshot``) and from then on refuses inserts inside the range.
@@ -12,22 +12,41 @@ range and row count (``check_snapshot``) and from then on refuses inserts inside
 ``load`` is the only way to obtain rows of a snapshot. It reads the record and the rows in a
 single read-only REPEATABLE READ transaction, refuses an unknown snapshot, a non-PASS
 verdict, an unknown format, an oversized snapshot, any source mismatch or a quality
-configuration it does not hold (configurations are given to the store keyed by their hash;
-a snapshot is never re-judged under a different one), and returns a ``VerifiedDataset`` only
-if the recomputed row count, hashes and quality report are identical. There is no override.
+configuration the trusted registry does not approve (a snapshot is never re-judged under a
+different one), and returns a ``VerifiedDataset`` only if the recomputed row count, hashes
+and quality report are identical. There is no override.
+
+Trust (ADR 0015): ``freeze`` and ``load`` refuse to run without a ``QualityConfigRegistry``
+that verifies (the packaged configuration with the pinned trust root, or a fixture registry
+inside a test session) and use only configurations that registry returns from
+``approved()``: APPROVED content with exactly one matching approval record. ``freeze``
+requires the configuration it is given to *be* that registry object, so a configuration
+built, replaced or rehashed in memory is refused before anything is written.
+
+The store is part of that boundary. It cannot be subclassed, it has no instance dictionary
+and refuses attribute assignment after construction, and the authorisation decision is made
+by module functions (``_store_registry``, ``_verified_registry``, ``_approved_config``),
+not by methods a subclass or an instance attribute could replace. The registry is verified
+when the store is built and again, before any connection is opened, at the start of every
+``freeze`` and ``load``. These checks stop ordinary mistakes and convenient bypasses; code
+in the same process that deliberately rewrites objects with ``object.__setattr__`` or
+patches classes is outside the threat model (ADR 0015 §4).
+
+``judge`` (``sentinel data-gate``) needs no registry and accepts provisional configurations:
+a report is diagnostics, not authority.
 """
 
 from __future__ import annotations
 
 import uuid
-from collections.abc import Generator, Mapping
+from collections.abc import Generator
 from contextlib import closing
 from datetime import UTC
-from types import MappingProxyType
 from typing import Any, Final
 
 from sqlalchemy import Connection, Engine, text
 
+from sentinel.config.quality_loader import QualityConfigRegistry
 from sentinel.domain.dataset import (
     DATASET_FORMAT,
     DatasetError,
@@ -41,7 +60,7 @@ from sentinel.domain.dataset import (
     judge_dataset,
 )
 from sentinel.domain.market_data import OHLC, Candle, Timeframe
-from sentinel.domain.quality import QualityConfig
+from sentinel.domain.quality import QualityConfig, QualityConfigError
 
 __all__ = ["DEFAULT_MAX_ROWS", "SERIES_LOCK_CLASS", "PostgresDatasetStore"]
 
@@ -106,21 +125,65 @@ def _record(row: Any) -> SnapshotRecord:
     )
 
 
+def _verified_registry(registry: object, what: str) -> QualityConfigRegistry:
+    """``registry`` if it is a genuine registry that may authorise here; else refuse."""
+    if registry is None:
+        raise DatasetError(f"no trusted quality registry: cannot {what}")
+    if type(registry) is not QualityConfigRegistry:
+        raise DatasetError("registry must be a QualityConfigRegistry (not a subclass)")
+    try:  # the seal, the origin and (for the packaged configuration) the pinned trust root
+        return registry.verify()
+    except QualityConfigError as exc:
+        raise DatasetError(f"cannot {what}: {exc}") from exc
+
+
+def _approved_config(registry: QualityConfigRegistry, sha256: str, what: str) -> QualityConfig:
+    """The registry's approved configuration with this hash, or refuse (fail closed)."""
+    try:  # approved() verifies the registry again
+        return registry.approved(sha256)
+    except QualityConfigError as exc:
+        raise DatasetError(f"cannot {what}: {exc}") from exc
+
+
+def _store_registry(store: PostgresDatasetStore, what: str) -> QualityConfigRegistry:
+    """The store's registry, verified again; called before any connection is opened."""
+    if type(store) is not PostgresDatasetStore:
+        raise DatasetError(f"not a PostgresDatasetStore: cannot {what}")
+    return _verified_registry(store._registry, what)
+
+
 class PostgresDatasetStore:
+    __slots__ = ("_engine", "_max_rows", "_registry")
+    _engine: Engine
+    _max_rows: int
+    _registry: QualityConfigRegistry | None
+
     def __init__(
         self,
         engine: Engine,
         *,
-        quality_configs: Mapping[str, QualityConfig] = MappingProxyType({}),
+        registry: QualityConfigRegistry | None = None,
         max_rows: int = DEFAULT_MAX_ROWS,
     ) -> None:
-        """``quality_configs`` maps configuration hash to configuration; ``load`` refuses a
-        snapshot whose configuration is not among them. ``freeze`` takes its own."""
+        """``registry`` is the trusted quality registry; without one, ``freeze`` and ``load``
+        refuse (``judge`` does not need it). A registry that does not verify is refused here,
+        before ``freeze`` or ``load`` could reach the database."""
         if max_rows < 1:
             raise ValueError("max_rows must be positive")
-        self._engine = engine
-        self._configs = MappingProxyType(dict(quality_configs))
-        self._max_rows = max_rows
+        if registry is not None:
+            _verified_registry(registry, "use this quality registry")
+        object.__setattr__(self, "_engine", engine)
+        object.__setattr__(self, "_registry", registry)
+        object.__setattr__(self, "_max_rows", max_rows)
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("PostgresDatasetStore cannot be subclassed")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("PostgresDatasetStore is read-only")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("PostgresDatasetStore is read-only")
 
     @staticmethod
     def lock_series_exclusive(conn: Connection, symbol: str, timeframe: Timeframe) -> None:
@@ -136,6 +199,13 @@ class PostgresDatasetStore:
         """Judge, attest and store ``spec`` atomically. Refuses anything but a PASS."""
         if not isinstance(quality, QualityConfig):
             raise DatasetError("a quality configuration is required to freeze a snapshot")
+        registry = _store_registry(self, "freeze a snapshot")
+        trusted = _approved_config(registry, quality.sha256, "freeze a snapshot")
+        if trusted is not quality:
+            raise DatasetError(
+                f"quality configuration {quality.version} was not obtained from the trusted "
+                "registry; cannot freeze a snapshot"
+            )
         params = _params(spec)
         with self._engine.begin() as conn:
             self.lock_series_exclusive(conn, spec.symbol, spec.timeframe)
@@ -176,13 +246,13 @@ class PostgresDatasetStore:
                 raise DatasetError(f"this range is already frozen as snapshot {duplicate}")
             as_of = conn.execute(text("SELECT now()")).scalar_one().astimezone(UTC)
             with closing(self._stream(conn, spec)) as candles:
-                report = judge_dataset(spec, quality, as_of, candles)
-            if report.digest.rows > self._max_rows:
+                # judges exactly these rows; refuses FAIL and unapproved configurations
+                attestation = attest(spec, trusted, as_of, candles)
+            if attestation.rows > self._max_rows:
                 raise DatasetError(
-                    f"{report.digest.rows:,} rows exceed the snapshot limit of "
+                    f"{attestation.rows:,} rows exceed the snapshot limit of "
                     f"{self._max_rows:,}; freeze a shorter range"
                 )
-            attestation = attest(report)  # refuses FAIL and unapproved configurations
             row = conn.execute(
                 text(
                     "INSERT INTO sentinel.dataset_snapshots (snapshot_id, format, symbol, "  # noqa: S608
@@ -246,6 +316,7 @@ class PostgresDatasetStore:
             key = snapshot_id if isinstance(snapshot_id, uuid.UUID) else uuid.UUID(snapshot_id)
         except ValueError:
             raise DatasetError(f"unknown snapshot {snapshot_id!r}") from None
+        registry = _store_registry(self, "verify a snapshot")
         with (
             self._engine.connect().execution_options(isolation_level="REPEATABLE READ") as conn,
             conn.begin(),
@@ -278,13 +349,9 @@ class PostgresDatasetStore:
                     f"snapshot {record.snapshot_id}: source mismatch (snapshot "
                     f"{record.spec.source}, series registered to {registered})"
                 )
-            quality = self._configs.get(record.quality.config_sha256)
-            if quality is None or quality.sha256 != record.quality.config_sha256:
-                raise DatasetError(
-                    f"snapshot {record.snapshot_id}: quality configuration "
-                    f"{record.quality.config_sha256} is not available; the snapshot cannot be "
-                    "verified"
-                )
+            quality = _approved_config(
+                registry, record.quality.config_sha256, f"verify snapshot {record.snapshot_id}"
+            )
             with closing(self._stream(conn, record.spec)) as candles:
                 return issue_verified_dataset(record, candles, quality)
 
